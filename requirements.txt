@@ -1,0 +1,14 @@
+# Pinned to the versions in .venv/ as of 2026-08-12, verified working against
+# the whole tests/ corpus. opencv-python-*headless* rather than opencv-python:
+# the bot never opens a window, and the plain wheel drags in libGL/libglib,
+# which a slim container image does not have.
+#
+# Note the OpenCV pin is a *four*-part version. The wheels are released as
+# 5.0.0.93 and there is no 5.0.0 on PyPI at all, so truncating it to three parts
+# resolves to nothing and fails the image build on a bare `pip` exit 1. That sat
+# here unnoticed because .venv/ carries the non-headless twin at the same
+# version, so nothing local ever installs this file as written -- the GHCR build
+# is the first thing that did.
+discord.py==2.7.1
+numpy==2.5.1
+opencv-python-headless==5.0.0.93
