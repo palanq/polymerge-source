@@ -2835,6 +2835,12 @@ OVERLAY_LAYERS = (("shade", "shaded"),
 # Thin strokes on a sprite cost far less legibility than a color wash does.
 OVERLAY_FOG_ONLY = frozenset({"shade", "spawns"})
 
+# Per-layer opacity multiplier, applied on top of the file's own alpha.
+# `grid` covers explored terrain (see OVERLAY_FOG_ONLY above) and full-strength
+# lines compete with the map art underneath, so it's cut to let terrain show
+# through. Layers not listed here paint at their file's own alpha.
+OVERLAY_ALPHA = {"grid": 0.7}
+
 # Shading alone: it is what makes a flat expanse of fog readable as tiles,
 # where the grid and the spawn zones are clutter on a map being read for
 # territory. Note polybot overrides this with an empty default and always passes
@@ -2903,6 +2909,7 @@ def paint_overlays(out, wanted, n, fog_mask=None):
         bgr, a = layer
         if name in OVERLAY_FOG_ONLY and fog_mask is not None:
             a = a * fog_mask
+        a = a * OVERLAY_ALPHA.get(name, 1.0)
         np.copyto(out, np.clip(out.astype(np.float32) * (1.0 - a) + bgr * a,
                                0, 255).astype(np.uint8))
     return missing
