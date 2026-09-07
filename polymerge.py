@@ -470,23 +470,19 @@ def detect_corners(mask):
 # quantity that cannot vary.  On huge the corner estimate sat 0.061 degrees from
 # a 2400-point fit of that same file's own edges: noise, not a property of the
 # file.
+#
+# The corners are still measured and still matter -- they remain the source of
+# the two step *lengths* (see build_lattice), which are genuinely per-render.
+# It is only the two *directions* that are constants, so callers take them from
+# here rather than through a function that accepted corners and ignored them.
+#
+# NOT perpendicular: Polytopia's isometric board is a rotated rhombus, not a
+# rotated square (the two families meet at ~118 degrees, not 90), so treating
+# this as an orthonormal basis would silently rotate dir_b away from its true
+# direction.
 BOARD_EDGE_SLOPE = 0.5986            # rise/run of the dir_a family
 BOARD_DIR_A = np.array([1.0, BOARD_EDGE_SLOPE]) / np.hypot(1.0, BOARD_EDGE_SLOPE)
 BOARD_DIR_B = np.array([-BOARD_DIR_A[0], BOARD_DIR_A[1]])
-
-
-def edge_directions(top, right, left):
-    """Unit vectors along the two board-edge families.
-
-    Fixed, for the reason above; the corners are still accepted so callers do
-    not have to know that, and because they remain the source of the two step
-    *lengths* (see build_lattice), which are genuinely per-render.
-
-    NOT forced perpendicular: Polytopia's isometric board is a rotated rhombus,
-    not a rotated square (the two families meet at ~118 degrees, not 90), so
-    treating this as an orthonormal basis would silently rotate dir_b away from
-    its true direction."""
-    return BOARD_DIR_A, BOARD_DIR_B
 
 
 # Chrome is docked to the screen frame and runs horizontally or vertically; a
@@ -3400,7 +3396,7 @@ def template_geometry(path, dark_thresh, erode_px):
             _template_cache[key] = None
         else:
             corners = detect_corners(edge_t)
-            dirs = edge_directions(corners[0], corners[1], corners[3])
+            dirs = (BOARD_DIR_A, BOARD_DIR_B)
             _template_cache[key] = {
                 "bgr": bgr, "valid": valid_t, "edge": edge_t,
                 "corners": corners, "dirs": dirs,
