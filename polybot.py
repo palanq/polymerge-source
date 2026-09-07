@@ -128,6 +128,20 @@ OVERLAY_ALIASES = {"shading": "shade", "shaded": "shade", "checker": "shade",
 IMAGE_EXTS = {".jpg", ".jpeg", ".jfif", ".png", ".webp"}
 
 MAX_SHOTS = 8               # a merge should be no more than 6 shots (2 per player in 3v3)
+# ...and this is how many *attachments* the bot is willing to download in order
+# to find those 8. The two are different questions, and conflating them was a
+# real refusal: a player reacts a whole post, or a whole game channel, and gets
+# menu screenshots along with the map ones. MAX_SHOTS bounds the merge -- its
+# cost, and how many views of one board are worth compositing -- and a score
+# screen or tech tree contributes to neither, so it must not spend that budget.
+# It is enforced by polymerge instead (--max-shots), which is the only place
+# that knows which inputs are map screenshots: telling them apart needs the
+# pixels, and here they are still undownloaded attachments.
+#
+# So this one is purely a resource bound on the download. 3x leaves room for a
+# couple of menus alongside every map shot, which is the shape a reacted post
+# actually has; a player past it has reacted something other than one game.
+MAX_ATTACHMENTS = 3 * MAX_SHOTS
 # The largest *inbound* message the API accepts, so no attachment a player
 # could have posted can exceed it: "the maximum request size when sending a
 # message is 25 MiB" (Discord API reference, Create Message). A ceiling on what
@@ -732,6 +746,9 @@ async def run_polymerge(workdir, image_paths, map_size, out_path, overlays=None)
         # a player should not have to know that the bar is owner-only to get
         # their own city's population into the merge.
         "--city-bars",
+        # Applied by polymerge rather than here because it is counted after the
+        # menu prefilter -- see MAX_ATTACHMENTS.
+        "--max-shots", str(MAX_SHOTS),
     ]
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -1523,12 +1540,16 @@ async def do_merge(caller, map_size, overlays):
             msg += f" ({barren} marked {message} had no image on {it}.)"
         await caller.send(msg)
         return
-    if len(shots) > MAX_SHOTS:
+    if len(shots) > MAX_ATTACHMENTS:
         # Easy to hit from history, since one post can carry several images.
+        # Against MAX_ATTACHMENTS, not MAX_SHOTS: the merge's own limit counts
+        # only the shots that show the map, and that cannot be known until they
+        # are downloaded (see MAX_ATTACHMENTS). polymerge applies it and its
+        # refusal reaches the channel the same way every other one does.
         hint = (" Un-react some and try again." if from_history
                 else " Send fewer at a time.")
         await caller.send(f"Found {len(shots)} screenshots, limit is "
-                          f"{MAX_SHOTS}. {SAD_EMOJI}{hint}")
+                          f"{MAX_ATTACHMENTS}. {SAD_EMOJI}{hint}")
         return
     oversized = [a.filename for a in shots if a.size > MAX_ATTACHMENT_BYTES]
     if oversized:

@@ -634,6 +634,101 @@ def _board_component(m, dirs=None):
     return np.where(np.isin(lab, keep), m, 0).astype(m.dtype)
 
 
+# --- menu screenshots (score screen, tech tree, ...) ------------------------
+#
+# Players sometimes react to a *score screen* -- the scoreboard the game draws
+# full-screen over a dimmed copy of the map. It is board-ish enough to anchor,
+# and merging one is silently destructive: measured with tests/score screens/
+# ss1.jpg added to goon_test2, it found three board edges, anchored, locked 63
+# fog tiles, won 50 tiles, and took that merge's union from 238 to 269 and its
+# conflicts from 4 to 84 -- on a board it does not even belong to.
+#
+# Nothing already here can see it, and the two obvious tests both fail outright:
+#   --min-fog-lock  cannot, because the fog test is NCC and NCC is
+#                   illumination-invariant by design (that is the whole reason
+#                   it is used), so a fog cube under a dimming scrim still
+#                   correlates at 0.95 and locks like any other.
+#   brightness      cannot, because the populations overlap. Measured over the
+#                   corpus, the score screens' mean V is 35.3/35.6/47.8 against
+#                   a darkest real shot of 48.6, and their fraction of frame
+#                   above V=200 is 0.062/0.073/0.083 against a real minimum of
+#                   0.084. A zoomed-in shot of a dark board is just as dim.
+#
+# What separates them is the projection, which is a game fact rather than an
+# appearance: the camera is fixed orthographic isometric, so every edge on the
+# board -- rim, tile border, territory dash, terrain facet -- runs at dir_a
+# (30.7 deg) or dir_b (149.0 deg), and *nothing on it is horizontal*. A menu is
+# laid out with the screen instead: text baselines, dot leaders, rules and panel
+# edges are horizontal or vertical. This is exactly _board_component's chrome
+# test above, asked of a whole frame rather than of one component, and it reuses
+# that test's BOARD_ANGLE_TOL for the same reason.
+#
+# Measured over all 80 corpus shots plus the three score screens, as the share
+# of strong-edge energy committed to a board angle rather than to the screen:
+#
+#     score screens                 0.198  0.216  0.236
+#     worst real shot               0.460  (badland_test3/cym.png, whose
+#                                           "Waiting for yodagem" banner
+#                                           survives the crop)
+#     every other real shot        >0.550
+#
+# 0.35 is mid-gap, 1.48x clear on both sides. Swept over probe width
+# (192-512 px), edge percentile (85-96) and tolerance (4-7 deg) the two
+# populations never overlap, at margins of 1.17x to 2.08x.
+#
+# **The HUD crop is load-bearing, not incidental.** With top_crop/bottom_crop at
+# 0 the margin does not merely shrink, it *inverts* -- to 0.69x -- because a
+# real gameplay shot's score banner and action-button row are horizontal chrome
+# of exactly the kind this keys on. The bands have to go before the question is
+# asked.
+#
+# Evidence base: three score screens, all from the same menu. Read the margin as
+# comfortable rather than as established -- a differently-laid-out menu (the
+# tech tree, say) has not been measured at all.
+MENU_BOARD_ANGLE_FRAC = 0.35   # below this, the frame is not a view of the board
+MENU_PROBE_WIDTH = 256         # long edge the probe downsamples to
+MENU_EDGE_PCT = 92.0           # gradient magnitude percentile counted as an edge
+
+
+def board_angle_fraction(img, dirs, top_crop=0.0, bottom_crop=0.0,
+                         width=MENU_PROBE_WIDTH):
+    """Of this frame's strong-edge energy running either at a board angle or
+    with the screen, the share running at a board angle.
+
+    ~0.6-0.9 for a screenshot of the board, ~0.2 for a menu drawn over one. See
+    MENU_BOARD_ANGLE_FRAC for the measured populations and the bar.
+
+    The screen-aligned energy is the denominator rather than all of it, which
+    makes the answer a *ratio between two families* instead of a share of
+    whatever else the frame happens to contain -- so it does not move with how
+    textured the shot is. Costs ~7ms per shot at the default width."""
+    h = img.shape[0]
+    sub = img[int(round(h * top_crop)): h - int(round(h * bottom_crop))]
+    if sub.size == 0:
+        return 1.0
+    s = width / max(sub.shape[0], sub.shape[1])
+    g = cv2.cvtColor(cv2.resize(sub, None, fx=s, fy=s,
+                                interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    sel = mag >= max(float(np.percentile(mag, MENU_EDGE_PCT)), 1e-6)
+    if int(sel.sum()) < 50:
+        return 1.0     # nothing to judge; never reject on an absence of evidence
+    # An edge runs perpendicular to its own gradient, hence the 90 deg turn.
+    ang = (np.degrees(np.arctan2(gy[sel], gx[sel])) + 90.0) % 180.0
+    m = mag[sel]
+
+    def energy_at(deg):
+        gap = np.abs(ang - deg)
+        return float(m[np.minimum(gap, 180.0 - gap) <= BOARD_ANGLE_TOL].sum())
+
+    board = sum(energy_at(np.degrees(np.arctan2(d[1], d[0])) % 180.0)
+                for d in dirs)
+    screen = energy_at(0.0) + energy_at(90.0)
+    return board / max(board + screen, 1e-9)
+
+
 def board_region(mask, dirs, open_px=15, close_px=15):
     """The board's own silhouette as a mask, chrome removed.
 
@@ -3739,6 +3834,13 @@ def main():
     ap.add_argument("--reproj", type=float, default=6.0)
     ap.add_argument("--nfeatures", type=int, default=20000)
     ap.add_argument("--contrast", type=float, default=0.02)
+    ap.add_argument("--max-shots", type=int,
+                    help="refuse the run if more than this many inputs survive "
+                         "the menu prefilter. Counted *after* it deliberately: "
+                         "the limit exists to bound the cost and the quality of "
+                         "a merge, and a menu screenshot contributes to "
+                         "neither, so spending the budget on one would refuse "
+                         "merges that are well inside it. No limit by default.")
     ap.add_argument("--debug-dir")
     args = ap.parse_args()
 
@@ -3795,6 +3897,47 @@ def main():
                     badge_halo_of[name] = badge_halo(badge, found)
                     edge_mask[name] = edge_mask[name] & ~badge_halo_of[name]
                 badge_mask_of[name] = badge
+
+    # A score screen is a menu drawn over a dimmed copy of the map, and it
+    # anchors well enough to poison a merge (see board_angle_fraction). Dropped
+    # here, before anything else looks at these shots -- in particular before
+    # detect_map_size, which one could otherwise contribute a board-size
+    # measurement to.
+    #
+    # The projection angles come straight from BOARD_DIR_A/BOARD_DIR_B, so this
+    # needs no template and no probe: the camera is fixed orthographic
+    # isometric, and those are a constant of it rather than of any one render.
+    all_names = list(names)
+    with PHASES("menu-screenshot prefilter"):
+        for name in list(names):
+            frac = board_angle_fraction(imgs[name], (BOARD_DIR_A, BOARD_DIR_B),
+                                        args.top_crop, args.bottom_crop)
+            if frac < MENU_BOARD_ANGLE_FRAC:
+                # Console only; the channel gets the DROPPED summary below.
+                print(f"{name}: not a view of the board -- only {frac:.0%} "
+                      f"of its detail runs at a board angle (a score screen "
+                      f"or other menu drawn over the map?)")
+                names.remove(name)
+    if not names:
+        # Cause and remedy on the one line, as every refusal here does: polybot
+        # promotes only the first line to the channel. No mention of edge angles
+        # -- a player cannot act on that, and infers the shape of it from the
+        # remedy anyway.
+        raise SystemExit("these look like score screens or menus rather than "
+                         "the map itself. Please retry with in-game "
+                         "screenshots of the map.")
+
+    # Counted here rather than by the caller, and that is the whole point of the
+    # option: the menu prefilter is the only thing that knows which inputs are
+    # map screenshots, it needs the pixels to know it, and polybot has them only
+    # as undownloaded attachments at the point where it would otherwise check.
+    # Charging a score screen against the budget refuses merges that are well
+    # inside it -- a 3v3 where everyone posts a map and a score screen is 12
+    # images and 6 shots.
+    if args.max_shots is not None and len(names) > args.max_shots:
+        raise SystemExit(f"too many screenshots: {len(names)} of these show the "
+                         f"map, and the limit is {args.max_shots}. Please retry "
+                         f"with fewer.")
 
     # Only when the caller omitted it: an explicit --map-size is always obeyed,
     # so this can never override a size someone actually meant.
@@ -4037,9 +4180,12 @@ def main():
     # someone's territory. A real user reported exactly this ("failed to
     # attach the oum ss") and only caught it by eye. polybot parses this line
     # to say so in the channel -- keep the prefix stable if you edit it.
-    dropped_names = [n for n in names if n not in to_template_of]
+    # Over all_names, not names: a shot the menu prefilter removed above is
+    # just as absent from the composite as one that failed to anchor, and the
+    # player is owed the same line about it.
+    dropped_names = [n for n in all_names if n not in to_template_of]
     if dropped_names:
-        print(f"DROPPED {len(dropped_names)}/{len(names)}: "
+        print(f"DROPPED {len(dropped_names)}/{len(all_names)}: "
               + ", ".join(dropped_names))
     names = [n for n in names if n in to_template_of]
 
