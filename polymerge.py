@@ -455,15 +455,38 @@ def detect_corners(mask):
     return top, right, bottom, left, residual
 
 
+# The projection is fixed, so the two edge families have one angle at every
+# board size and on every device -- this is a constant, not something to
+# re-estimate per render.  It is NOT atan(3/5) = 30.9638; that was measured by
+# an estimator that turned out to be the odd one out.  What the renders and the
+# captures actually show is a slope of 0.5986, which four independent routes
+# agree on (see CLAUDE.md, "Don't feed the exact 3:5 angle into edge_lines"):
+# the blanks' silhouettes, 30 clean screenshot bottom edges across 21 sets, a
+# harmonic trend fit that projects out the fog cube's scalloped lip, and -- on
+# huge, to 0.005 degrees -- the interior fog lattice measured by phase drift.
+#
+# Deriving it per render from three corner *pixels* is what this replaced, and
+# that scattered 0.24 degrees across the five blanks (30.7247 to 30.9699) for a
+# quantity that cannot vary.  On huge the corner estimate sat 0.061 degrees from
+# a 2400-point fit of that same file's own edges: noise, not a property of the
+# file.
+BOARD_EDGE_SLOPE = 0.5986            # rise/run of the dir_a family
+BOARD_DIR_A = np.array([1.0, BOARD_EDGE_SLOPE]) / np.hypot(1.0, BOARD_EDGE_SLOPE)
+BOARD_DIR_B = np.array([-BOARD_DIR_A[0], BOARD_DIR_A[1]])
+
+
 def edge_directions(top, right, left):
-    """Unit vectors along the two board-edge families, from a complete
-    (template) corner fit. NOT forced perpendicular: Polytopia's isometric
-    board is a rotated rhombus, not a rotated square (the two edge families
-    meet at ~116/64 degrees, not 90), so treating them as an orthonormal
-    basis would silently rotate dir_b away from its true direction."""
-    dir_a = (right - top) / np.linalg.norm(right - top)
-    dir_b = (left - top) / np.linalg.norm(left - top)
-    return dir_a, dir_b
+    """Unit vectors along the two board-edge families.
+
+    Fixed, for the reason above; the corners are still accepted so callers do
+    not have to know that, and because they remain the source of the two step
+    *lengths* (see build_lattice), which are genuinely per-render.
+
+    NOT forced perpendicular: Polytopia's isometric board is a rotated rhombus,
+    not a rotated square (the two families meet at ~118 degrees, not 90), so
+    treating this as an orthonormal basis would silently rotate dir_b away from
+    its true direction."""
+    return BOARD_DIR_A, BOARD_DIR_B
 
 
 # Chrome is docked to the screen frame and runs horizontally or vertically; a
@@ -712,6 +735,44 @@ def edge_lines(pts, dir_a, dir_b, windows=(40.0, 15.0, 8.0), tol=3.0):
 PIXEL_FOG_SAT = 110      # 98.8% of the all-fog template's pixels sit below this
 
 
+def fogish_mask(valid, hsv, gray):
+    """Pixels that *could* be fog by colour: bright and unsaturated.
+
+    Deliberately a nominator and never a classifier -- the same distinction that
+    makes RUIN_NOMINATE_SAT acceptable. Mountains, snow, ice and pale sand are
+    exactly as desaturated as the fog cube, so this admits 83.5% of a Polaris
+    player's valid pixels (xizauh/pol.jpg) and 49.2% of a desert board's
+    (badland_test/oum.jpg). It is safe only where a false positive costs work
+    rather than an answer."""
+    return (valid > 0) & (hsv[:, :, 1] < PIXEL_FOG_SAT) & (gray > 140)
+
+
+# joint_register scores a shot's fog against the template's, and sums only the
+# top JOINT_TOP_K tiles -- so a tile that cannot be fog by colour is paid for at
+# every one of the ~2000 candidates and then discarded by the sort. Dropping
+# those from the sample grid is the single largest saving in the program: the
+# gather is 94% of joint_register and ~56% of a merge's wall clock, and its cost
+# is linear in the tile count.
+#
+# The keep-set is chosen ONCE, at full resolution, from the incoming edge prior,
+# and reused at every pyramid level. It has to be fixed rather than decided per
+# candidate -- deciding per candidate means gathering the mask at exactly the
+# coordinates you meant to skip -- and there is nothing to gain from recomputing
+# it per level, since the prior moves by at most a few percent of zoom and ~24px
+# of pan across the whole search. Measured: per-level and once-only give
+# identical cross-check numbers on every set tried.
+#
+# The floor is load-bearing. 30 of the corpus's 74 shots keep fewer than 120
+# tiles on colour alone, and several keep fewer than JOINT_TOP_K -- replay_ss2's
+# two shots keep 5 and 6 of 256, star_change/oum 11 of 324 -- so without it the
+# objective on a fog-poor shot collapses to a sum over almost nothing. Topping
+# up from the ranking costs the fog-heavy shots nothing, because the threshold
+# has already kept more than the floor there.
+JOINT_TOP_K = 60
+JOINT_TILE_FOG_FRAC = 0.50
+JOINT_TILE_FLOOR = 120
+
+
 def _masked_shift_ncc(gray, fogish, dx, dy, min_overlap):
     """NCC between the image and itself shifted by (dx, dy), over pixels that
     are fog-ish at both ends of the shift."""
@@ -787,7 +848,7 @@ def fog_period_scale(gray, valid, hsv, dir_a, tile_px,
     Only needed by a shot with no opposite pair of board edges; an edge pair is
     a cheaper prior of similar quality. Returns (s_it, period_px, ncc) or
     None if no periodic fog is found."""
-    fogish = (valid > 0) & (hsv[:, :, 1] < PIXEL_FOG_SAT) & (gray > 140)
+    fogish = fogish_mask(valid, hsv, gray)
     q = 4
     gq = cv2.resize(gray, (gray.shape[1] // q, gray.shape[0] // q),
                     interpolation=cv2.INTER_AREA)
@@ -910,8 +971,8 @@ def _tile_sample_grid(origin, u_col, u_row, n, inset, div, max_px=320):
     return X, Y
 
 
-def _fog_alignment_score(img_g, tmpl_vals, vmask, X, Y, dx, dy, top_k,
-                         min_valid):
+def _fog_alignment_score(img_flat, tmpl_vals, vmask_flat, base, shape, off,
+                         top_k, min_valid):
     """Sum of the top_k per-tile correlations with the template's fog art.
 
     Only the most fog-like tiles are counted: explored terrain correlates with
@@ -924,11 +985,22 @@ def _fog_alignment_score(img_g, tmpl_vals, vmask, X, Y, dx, dy, top_k,
     is identical for every call within a pyramid level -- several hundred of
     them -- and hoisting it out drops a third of this function's memory
     traffic. See joint_register, which computes it once per level."""
-    a = img_g[Y + dy, X + dx].astype(np.float32)
+    # Gather through a *flat* take rather than a 2-D fancy index. Same values,
+    # same order, bit-identical result -- but numpy's 2-D fancy indexing builds
+    # the coordinate pair per element, and a 1-D take does not: measured 0.630ms
+    # against 0.086ms for this function's two gathers, which is 7.3x on them and
+    # 1.76x on the whole call. It is what makes the per-pan cost small enough
+    # that the sweep is dominated by the arithmetic rather than by addressing.
+    #
+    # `base` is the flat index at zero pan and is invariant for a whole pyramid
+    # level; a pan of (dx, dy) is the *scalar* `off` = dy*width + dx, so the only
+    # per-call address work is one integer add over the sample grid.
+    idx = base + off
+    a = img_flat.take(idx).astype(np.float32).reshape(shape)
     b = tmpl_vals
-    v = (vmask[Y + dy, X + dx] > 0).astype(np.float32)
+    v = (vmask_flat.take(idx).reshape(shape) > 0).astype(np.float32)
     cnt = v.sum(1)
-    keep = cnt >= min_valid * X.shape[1]
+    keep = cnt >= min_valid * shape[1]
     if not keep.any():
         return -1.0
     a, b, v, cnt = a[keep], b[keep], v[keep], cnt[keep]
@@ -936,6 +1008,35 @@ def _fog_alignment_score(img_g, tmpl_vals, vmask, X, Y, dx, dy, top_k,
     bc = (b - ((b * v).sum(1) / cnt)[:, None]) * v
     den = np.sqrt((ac * ac).sum(1) * (bc * bc).sum(1))
     ncc = np.where(den > 1e-6, (ac * bc).sum(1) / np.maximum(den, 1e-6), 0.0)
+    k = min(top_k, ncc.size)
+    return float(np.sort(ncc)[-k:].sum())
+
+
+def _fog_full_score(img_flat, bc_pre, bden, base, shape, off, top_k):
+    """`_fog_alignment_score` for tiles with no invalid sample, in closed form.
+
+    The masked correlation has to centre *both* sides over whichever samples are
+    valid, and which samples those are depends on the pan -- a pan slides the
+    sample grid, so a tile at the edge of what this shot photographed reads real
+    pixels at one offset and the warp's zero border at another. That is why the
+    template side cannot simply be hoisted out of the loop the way `tmpl_vals`
+    is: `b - mean(b over valid)` is a different vector at every pan.
+
+    For a tile whose samples are *all* valid the mean is over all of them, so it
+    is pan-independent and `bc_pre = b - mean(b)` and `bden = |bc_pre|` come from
+    the caller, computed once per pyramid level. Then sum(ac*bc) collapses to
+    sum(a*bc_pre) because sum(bc_pre) = 0, and sum(ac^2) to
+    sum(a^2) - sum(a)^2/n. Three reductions over the shot's samples instead of
+    the ~ten passes the masked form needs, and no validity gather at all --
+    measured 0.079ms against 0.534ms on a div=2 call.
+
+    It reaches the same quantity by a different route, so it agrees with the
+    masked form to ~1e-5 relative rather than bit-for-bit. See joint_register for
+    where it is used and why not at div=1."""
+    a = img_flat.take(base + off).astype(np.float32).reshape(shape)
+    sa = a.sum(1)
+    den = np.sqrt(np.maximum((a * a).sum(1) - sa * sa / shape[1], 0.0)) * bden
+    ncc = np.where(den > 1e-6, (a * bc_pre).sum(1) / np.maximum(den, 1e-6), 0.0)
     k = min(top_k, ncc.size)
     return float(np.sort(ncc)[-k:].sum())
 
@@ -1004,8 +1105,41 @@ def _prune_beam(cand, width, min_sep):
     return kept or [max(cand)]
 
 
+def _fogish_tiles(img, valid, gray, origin, u_col, u_row, n, Wt, Ht,
+                  scale0, trans0):
+    """Which of the n*n tiles joint_register should bother scoring.
+
+    A tile is kept if at least JOINT_TILE_FOG_FRAC of its samples could be fog
+    by colour under the edge-derived prior, with JOINT_TILE_FLOOR tiles kept
+    regardless (topped up from the ranking) so a fog-poor shot still has an
+    objective. See the constants for why each half is there.
+
+    Measured at the prior across all 74 corpus shots, this excludes no tile that
+    goes on to lock fog at the final anchor on 71 of them; the three exceptions
+    (goon_test2/imp 11 of 58, control_c 5 of 76, control_d 1 of 88) lose
+    accuracy rather than truth, since the tile is still merged and only its vote
+    on the anchor is dropped. The floor recovers most of that in practice."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    fogish = fogish_mask(valid, hsv, gray).astype(np.uint8)
+    M = np.array([[scale0, 0.0, trans0[0]], [0.0, scale0, trans0[1]]])
+    warped = cv2.warpAffine(fogish, M, (Wt, Ht), flags=cv2.INTER_NEAREST)
+    pad = 16
+    warped = cv2.copyMakeBorder(warped, pad, pad, pad, pad,
+                                cv2.BORDER_CONSTANT, 0)
+    X, Y = _tile_sample_grid(origin, u_col, u_row, n, 0.25, 1)
+    Xc = np.clip(X + pad, 0, warped.shape[1] - 1)
+    Yc = np.clip(Y + pad, 0, warped.shape[0] - 1)
+    frac = warped[Yc, Xc].mean(1)
+    keep = frac >= JOINT_TILE_FOG_FRAC
+    n_fogish = int(keep.sum())
+    if n_fogish < JOINT_TILE_FLOOR:
+        keep = np.zeros(frac.size, bool)
+        keep[np.argsort(frac)[-min(JOINT_TILE_FLOOR, frac.size):]] = True
+    return keep, n_fogish
+
+
 def joint_register(img, valid, tmpl_gray, origin, u_col, u_row, n,
-                   scale0, trans0, top_k=60, min_valid=0.5):
+                   scale0, trans0, top_k=JOINT_TOP_K, min_valid=0.5):
     """Refine zoom and pan *together*, coarse to fine, against the fog artwork.
 
     Jointly, not one after the other, because they are not independent: a zoom
@@ -1017,6 +1151,21 @@ def joint_register(img, valid, tmpl_gray, origin, u_col, u_row, n,
     Returns the image -> template affine."""
     Ht, Wt = tmpl_gray.shape
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    keep, n_fogish = _fogish_tiles(img, valid, gray, origin, u_col, u_row, n,
+                                   Wt, Ht, scale0, trans0)
+    # Sum the best `top_k` per-tile correlations, but never more of them than
+    # there are tiles that could be fog at all. The score's job is to add up the
+    # evidence, and a tile that is not fog still contributes a correlation
+    # against fog art that moves with the candidate for reasons unrelated to
+    # alignment -- so on a shot with 11 fog-ish tiles a fixed k of 60 sums 11
+    # signals and 49 noise terms, and the noise wins. The colour count is a
+    # generous upper bound on the fog (it admits 83.5% of a Polaris shot's
+    # pixels), which is exactly what makes it safe to cap by: it errs toward
+    # leaving k alone. 14 of the corpus's 77 shots see a smaller k.
+    top_k = min(top_k, max(n_fogish, 1))
+    # The board's centre in template space. The zoom sweep below pivots about
+    # it; see the note at the sweep for why that is not the same search.
+    board_c = origin + (n / 2.0) * u_col + (n / 2.0) * u_row
     beam = [(-2.0, float(scale0), float(trans0[0]), float(trans0[1]))]
     for div, s_span, s_step, p_rad, p_step, emit in JOINT_LEVELS:
       # Timed per pyramid level: this loop is ~70% of the program's runtime, and
@@ -1034,15 +1183,42 @@ def joint_register(img, valid, tmpl_gray, origin, u_col, u_row, n,
               valid, (valid.shape[1] // div, valid.shape[0] // div),
               interpolation=cv2.INTER_NEAREST)
           X, Y = _tile_sample_grid(origin, u_col, u_row, n, 0.25, div)
+          # Same (i, j) row order at every div, so one boolean selects the same
+          # tiles throughout.
+          X, Y = X[keep], Y[keep]
           pad = p_rad + 4
           tgtp = cv2.copyMakeBorder(tgt, pad, pad, pad, pad, cv2.BORDER_CONSTANT, 0)
           Xp, Yp = X + pad, Y + pad
           # Invariant across every zoom and pan tried at this level; see
           # _fog_alignment_score.
           tvals = tgtp[Yp, Xp].astype(np.float32)
-          cand = []
+          # Flat sample addresses for this level; see _fog_alignment_score.
+          # tgtp/wgp/wvp all share this padded width, so one base serves all.
+          pw = tgtp.shape[1]
+          base = (Yp.astype(np.int64) * pw + Xp.astype(np.int64)).astype(np.int32)
+          shape = Xp.shape
+          # Most scored tiles have no invalid sample anywhere in this level's
+          # search, and those are far cheaper to score (_fog_full_score). Only
+          # the coarse levels take it. Not because they are the best fit -- they
+          # are the worst, since pan radius is in each level's own pixels so
+          # div=4 slides +-24 template px against div=1's +-2, and erodes four
+          # times as much boundary (mean fully-valid share 0.63 / 0.74 / 0.80
+          # over 21 shots). They are simply where the time is: div=4 and div=2
+          # are ~69% of the scoring cost, and div=1 stays on the exact masked
+          # score so the final answer is still chosen at full fidelity.
+          fast = div > 1
+          if fast:
+              bc_pre = tvals - tvals.mean(1)[:, None]
+              bden = np.sqrt((bc_pre * bc_pre).sum(1))
+              pan_se = np.zeros((2 * p_rad + 1, 2 * p_rad + 1), np.uint8)
+              pan_se[::p_step, ::p_step] = 1
+          zooms = []
           seen = set()
-          for _, s_cur, tx, ty in beam:
+          for _, s_cur, tx0, ty0 in beam:
+              # Where this beam entry thinks the board's centre sits in the
+              # shot's own pixels. Holding that point still is what makes the
+              # zoom sweep and the pan sweep independent -- see below.
+              piv = (board_c - np.array([tx0, ty0])) / s_cur
               # Snap the sweep to a grid shared by every beam candidate rather
               # than one centered on each. Beam entries sit only s_step apart
               # (that is _prune_beam's separation rule), so their +-s_span
@@ -1054,28 +1230,116 @@ def joint_register(img, valid, tmpl_gray, origin, u_col, u_row, n,
               hi = int(np.ceil((s_cur + s_span) / s_step))
               for q in range(lo, hi + 1):
                   s = q * s_step
+                  # p_template = s * p_image + t scales about the image ORIGIN,
+                  # so holding t fixed and changing s does not rescale the board
+                  # in place -- it swings it across the frame by (s_cur - s)
+                  # times the board's distance from that origin, which is most
+                  # of a screenshot. Measured on the corpus, the sweep's ends
+                  # displace the board centre by 1.1x to 2.2x further than the
+                  # pan sweep at that level can pull it back, at *every* level:
+                  # +-39px against a +-24px reach at div=4, +-13 against +-6 at
+                  # div=2, +-3.9 against +-2.0 at div=1. So the extreme zooms
+                  # were being scored while guaranteed to be misregistered, for
+                  # a reason that says nothing about whether the zoom is right,
+                  # and the score surface was biased back toward the prior.
+                  #
+                  # Carrying the translation that holds the board centre fixed
+                  # removes the coupling: each zoom is scored at its own best
+                  # centring, and dx/dy below then search genuine pan.
+                  tx = tx0 + (s_cur - s) * piv[0]
+                  ty = ty0 + (s_cur - s) * piv[1]
                   # Same zoom *and* same pan origin means the identical set of
                   # (dx, dy) probes -- nothing new to learn from repeating it.
                   key = (q, round(tx, 3), round(ty, 3))
                   if key in seen:
                       continue
                   seen.add(key)
-                  # p_template = s * p_image + t, for div-downscaled inputs
-                  M = np.array([[s, 0.0, tx / div], [0.0, s, ty / div]])
-                  wg = cv2.warpAffine(small, M, (tw, th), flags=cv2.INTER_LINEAR)
-                  wv = cv2.warpAffine(small_v, M, (tw, th), flags=cv2.INTER_NEAREST)
-                  wgp = cv2.copyMakeBorder(wg, pad, pad, pad, pad,
-                                           cv2.BORDER_CONSTANT, 0)
-                  wvp = cv2.copyMakeBorder(wv, pad, pad, pad, pad,
-                                           cv2.BORDER_CONSTANT, 0)
-                  for dx in range(-p_rad, p_rad + 1, p_step):
-                      for dy in range(-p_rad, p_rad + 1, p_step):
-                          sc = _fog_alignment_score(wgp, tvals, wvp, Xp, Yp,
-                                                    dx, dy, top_k, min_valid)
-                          # sampling the image at +dx means the matching content
-                          # sits dx to the right, so the image moves by -dx
-                          cand.append((sc, float(s),
-                                       tx - dx * div, ty - dy * div))
+                  zooms.append((s, tx, ty))
+
+          def _warp_valid(s, tx, ty):
+              """This candidate's validity mask, in padded template space."""
+              M = np.array([[s, 0.0, tx / div], [0.0, s, ty / div]])
+              wv = cv2.warpAffine(small_v, M, (tw, th), flags=cv2.INTER_NEAREST)
+              return cv2.copyMakeBorder(wv, pad, pad, pad, pad,
+                                        cv2.BORDER_CONSTANT, 0)
+
+          # The fast path's tile set is settled ONCE for the whole level, as the
+          # intersection over every zoom candidate in it. Per candidate looks
+          # equivalent and is not: a different zoom warps the shot differently,
+          # so its coverage boundary moves and the boundary tiles flip -- 151 to
+          # 171 tiles across div=4's eight candidates on
+          # test_screenshots/IMG_3061, 29 of them unstable. The score is a sum
+          # over the top JOINT_TOP_K per-tile correlations, so a candidate whose
+          # set happened to be larger would draw its top-k from more tiles and
+          # win for a reason that has nothing to do with alignment. Fixing the
+          # set makes every candidate in a level answer the same question, which
+          # is a stronger property than the masked path has ever had (its own
+          # min_valid gate varies per pan).
+          #
+          # A tile qualifies only if it is valid at every *pan* too, which is
+          # what the erosion by the level's pan grid answers in one pass.
+          # borderValue 0 so anything the erosion reads off the padded canvas
+          # counts as invalid, rather than as no constraint, which is what
+          # cv2.erode assumes by default.
+          sel = None
+          if fast:
+              for s, tx, ty in zooms:
+                  full = (cv2.erode(_warp_valid(s, tx, ty), pan_se,
+                                    borderType=cv2.BORDER_CONSTANT, borderValue=0)
+                          .ravel().take(base).reshape(shape) > 0).all(1)
+                  sel = full if sel is None else (sel & full)
+                  # The intersection only shrinks, so a level that is already
+                  # short of top_k cannot recover -- stop rather than warping
+                  # the rest for an answer that is settled. This is what keeps
+                  # the pre-pass from costing the fog-poor shots anything.
+                  if int(sel.sum()) < JOINT_TOP_K:
+                      sel = None
+                      break
+          if sel is not None:
+              # A fog-poor shot keeps almost nothing here (star_change/oum holds
+              # 25 of 120 tiles at div=4), and below this bar the objective would
+              # be a sum over fewer terms than it is meant to select from. Such a
+              # level falls back to the exact masked score in full -- never a
+              # mix, since the two forms agree only to ~1e-5 and the beam
+              # compares candidates within a level against each other.
+              #
+              # The bar is the CONSTANT, not the per-shot `top_k` above. Those
+              # were the same number until the fog-ish cap landed, and keeping
+              # them tied would put every fog-poor shot onto the fast path as a
+              # side effect of shrinking its k -- two changes wearing one
+              # constant's name. Read it as a floor on how much evidence a level
+              # must hold before approximating is worth it, which is a different
+              # question from how much of that evidence the score sums.
+              bcp_s, bden_s = bc_pre[sel], bden[sel]
+              base_s, shape_s = base[sel], (int(sel.sum()), shape[1])
+
+          cand = []
+          for s, tx, ty in zooms:
+              # p_template = s * p_image + t, for div-downscaled inputs
+              M = np.array([[s, 0.0, tx / div], [0.0, s, ty / div]])
+              wg = cv2.warpAffine(small, M, (tw, th), flags=cv2.INTER_LINEAR)
+              wgp = cv2.copyMakeBorder(wg, pad, pad, pad, pad,
+                                       cv2.BORDER_CONSTANT, 0)
+              # ravel of a contiguous array is a view, so this is free
+              wgp_f = wgp.ravel()
+              # Only the exact path reads validity, and it re-warps rather than
+              # keeping every candidate's mask alive from the pre-pass: this
+              # branch is the rare one, and holding ~20 padded masks costs more
+              # than the warp it saves.
+              wvp_f = None if sel is not None else _warp_valid(s, tx, ty).ravel()
+              for dx in range(-p_rad, p_rad + 1, p_step):
+                  for dy in range(-p_rad, p_rad + 1, p_step):
+                      off = dy * pw + dx
+                      sc = (_fog_alignment_score(
+                                wgp_f, tvals, wvp_f, base, shape,
+                                off, top_k, min_valid)
+                            if sel is None else
+                            _fog_full_score(wgp_f, bcp_s, bden_s, base_s,
+                                            shape_s, off, top_k))
+                      # sampling the image at +dx means the matching content
+                      # sits dx to the right, so the image moves by -dx
+                      cand.append((sc, float(s),
+                                   tx - dx * div, ty - dy * div))
           beam = _prune_beam(cand, emit, s_step)
     return np.array([[beam[0][1], 0.0, beam[0][2]],
                      [0.0, beam[0][1], beam[0][3]]])
@@ -1282,7 +1546,7 @@ LONE_PAIR_EXTENT_HI = 1.15
 def anchor_to_template(img, mask, valid, hsv, tmpl_gray, t_off, dir_a, dir_b,
                        origin, u_col, u_row, n_tiles, min_support, label,
                        refine=True, min_scale_support=30, zoom_hint=None,
-                       sky_rebuild=None, pan_hint=None):
+                       sky_rebuild=None, pan_hint=None, cache=None):
     """Map one image onto the template.
 
     The board edges supply the starting estimate for both zoom and pan, and
@@ -1345,11 +1609,17 @@ def anchor_to_template(img, mask, valid, hsv, tmpl_gray, t_off, dir_a, dir_b,
     # cancel exactly (see the edge bullet in the module docstring).
     span = [t_off[1] - t_off[0], t_off[3] - t_off[2]]
 
+    # A private cache still dedups this call's own repeats (the sky rebuild
+    # re-fits, and anchor_all can re-anchor a shot in its second pass); a shared
+    # one additionally reuses whatever the size pre-pass already measured. See
+    # ShotCache for why sharing is only ever a hit when the parameters match.
+    cache = cache if cache is not None else ShotCache()
+
     tags = ["a-min", "a-max", "b-min", "b-max"]
 
     def fit_edges(m):
         with PHASES("anchor: board outline + edge fit"):
-            pts = board_boundary(m, (dir_a, dir_b))
+            pts = cache.boundary(label, m, (dir_a, dir_b))
             if len(pts) < 100:
                 return pts, None, None, False
             off, support = edge_lines(pts, dir_a, dir_b)
@@ -1380,6 +1650,11 @@ def anchor_to_template(img, mask, valid, hsv, tmpl_gray, t_off, dir_a, dir_b,
         print(f"  no usable board edge from brightness alone -- retrying with "
               f"the sunrise-sky test")
         mask, valid = sky_rebuild()
+        # The masks this shot is measured from have just been replaced, so
+        # anything already measured from the old ones is stale. Invalidating
+        # here rather than inside sky_rebuild keeps that obligation next to the
+        # reassignment it belongs to, and covers a caller that passed no cache.
+        cache.invalidate(label)
         pts, off, support, pan_ok = fit_edges(mask)
     if off is None:
         raise SystemExit(f"{label}: no board outline found (only {len(pts)} "
@@ -1481,8 +1756,8 @@ def anchor_to_template(img, mask, valid, hsv, tmpl_gray, t_off, dir_a, dir_b,
         # its own pixels and divide. Costs one extra fog_period_scale (~0.2s)
         # and is what catches a wrong --map-size (see main).
         with PHASES("anchor: board-size check"):
-            got = fog_period_scale(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY),
-                                   valid, hsv, dir_a, np.linalg.norm(u_col))
+            got = cache.period(label, img, valid, hsv, dir_a,
+                               np.linalg.norm(u_col))
         if got is not None:
             spans = [off[hi] - off[lo] for k, (lo, hi) in enumerate([(0, 1), (2, 3)])
                      if have_scale[lo] and have_scale[hi]]
@@ -1500,8 +1775,8 @@ def anchor_to_template(img, mask, valid, hsv, tmpl_gray, t_off, dir_a, dir_b,
     else:
         zoom_source = "fog-period"
         with PHASES("anchor: fog-period zoom fallback"):
-            got = fog_period_scale(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY),
-                                   valid, hsv, dir_a, np.linalg.norm(u_col))
+            got = cache.period(label, img, valid, hsv, dir_a,
+                               np.linalg.norm(u_col))
         if got is None:
             raise SystemExit(f"{label}: no opposite edge pair, and no periodic "
                              f"fog found to read the zoom off -- pale terrain "
@@ -1644,8 +1919,16 @@ def cross_check(anchors, sift_edges, t_corners, tile_px):
 
 
 def build_lattice(top, right, left, n):
-    u_col = (right - top) / n
-    u_row = (left - top) / n
+    """The two tile step vectors, and the board's north corner as the origin.
+
+    Direction comes from the fixed basis and only the *length* from the corners.
+    The lattice and the silhouette are at the same angle -- confirmed with the
+    project owner, and measured to 0.005 degrees on huge (see the note above
+    BOARD_EDGE_SLOPE) -- so taking the direction from three corner pixels here
+    would put the tile grid at a slightly different angle from the edge fit for
+    no reason, which is the one thing that is certainly wrong."""
+    u_col = BOARD_DIR_A * (np.linalg.norm(right - top) / n)
+    u_row = BOARD_DIR_B * (np.linalg.norm(left - top) / n)
     return top, u_col, u_row
 
 
@@ -2455,8 +2738,24 @@ def plate_edge_run(gray, vx, vy, s):
 #
 # Everything here is in **tile widths**, not template px, so none of it passes
 # through REFERENCE_TILE_PX at all: the geometry is a property of the board.
-BAR_TOP_BAND = (-0.090, 0.020)  # rows the bar's top edge can occupy, from the
-BAR_BOT_BAND = (0.070, 0.170)   # vertex; measured -0.06..-0.01 and +0.09..+0.15
+# The two edges are found as a *pair* whose separation is constrained, not as
+# two independently placed rows. The height is the tight quantity -- 0.138 to
+# 0.213 tile widths over the 49 confirmed bars in the six labeled sets, against
+# the 0.050 to 0.260 the bands alone admit -- so it is what should discriminate,
+# and the bands only have to keep the pair off the name plate above.
+#
+# Placing each row absolutely made the detector as accurate as the anchor: the
+# bands are ~9 and ~8 px at an 80px tile, and 12 of those 49 bars sat within
+# 0.02 tile widths of a band's outer wall, both replay ground truths exactly on
+# it. A ~2px anchor shift then dropped a bar with nothing else in the run
+# changing (goon_test2 loses (6,2) and (6,5) at JOINT_TOP_K 80). Constraining
+# the pair instead buys 0.04 tile widths of slack in each direction -- about
+# 3px -- for a constraint that is *stronger*, not weaker.
+BAR_TOP_BAND = (-0.130, 0.020)  # rows the bar's top edge can occupy, from the
+BAR_BOT_BAND = (0.030, 0.210)   # vertex; measured -0.093..-0.020 and +0.070..
+                                # +0.149, each widened by 0.04 for anchor slack
+BAR_HEIGHT = (0.125, 0.225)     # the pair's separation. Confirmed static
+                                # relative to the tile; measured 0.138..0.213
 BAR_HALVES = (0.482, 0.720)     # the only two legal half-widths: a short bar
                                 # spans 0.965 tiles and a capped one 1.44, a
                                 # clean 3:2 with nothing in between
@@ -2490,11 +2789,19 @@ BAR_BLUE_S = 180                # a filled segment is vividly blue. Water reads
                                 # cannot separate them -- the polarity rule in
                                 # detect_population_bars is what does.
 BAR_RED_S = 150                 # scorched_earth's Icalus reads S=255
-# The color box, one preset per legal width. The short bar's footprint is a
+# The *prefilter* color box -- the only one still preset, because it runs before
+# any geometry exists. That is what lets the color test reject a tile before the
+# row search happens; the second, post-geometry call takes its rows from the bar
+# it just measured (see detect_population_bars). The short bar's footprint is a
 # subset of the capped one, so the small box is inside the bar whichever length
-# this one turns out to be -- which is what lets the color test run *first*,
-# independently of the geometry, and reject a tile before any of it happens.
-BAR_BOX_ROWS = (0.010, 0.115)
+# this one turns out to be.
+#
+# The rows are centred on the median bar interior (-0.047..0.127), which is what
+# keeps the box on the bar under a couple of px of anchor error: it leaves 0.020
+# tile widths of margin against the lowest top edge observed and 0.034 against
+# the second-lowest bottom edge. Swept over five spans, this is the widest
+# minimum margin at both ends.
+BAR_BOX_ROWS = (0.000, 0.080)
 BAR_BOX_HALVES = (0.40, 0.62)
 
 # **No two cities sit within two tiles of each other** -- the placement rule is
@@ -2529,8 +2836,12 @@ def _bar_edges(bgr):
     return sy
 
 
-def _bar_mode(bgr, wmask, origin, u_col, u_row, i, j, half):
-    """Modal color in the preset box at tile (i, j): (bgr, is_bar, is_red).
+def _bar_mode(bgr, wmask, origin, u_col, u_row, i, j, half, rows=None):
+    """Modal color in a box at tile (i, j)'s south vertex: (bgr, is_bar, is_red).
+
+    `rows` is an absolute (y0, y1) span when the caller has already measured the
+    bar; otherwise the preset band is used. Only the first, prefiltering call
+    has no geometry to work from -- see detect_population_bars.
 
     `wmask` is this shot's `valid` mask, which is exactly the right filter --
     it drops UI chrome, out-of-frame pixels, and pixels too dark to judge color
@@ -2541,8 +2852,11 @@ def _bar_mode(bgr, wmask, origin, u_col, u_row, i, j, half):
     """
     tile = float(np.linalg.norm(u_col))
     vx, vy = origin + (i + 1) * u_col + (j + 1) * u_row
-    y0 = int(round(vy + BAR_BOX_ROWS[0] * tile))
-    y1 = int(round(vy + BAR_BOX_ROWS[1] * tile))
+    if rows is None:
+        y0 = int(round(vy + BAR_BOX_ROWS[0] * tile))
+        y1 = int(round(vy + BAR_BOX_ROWS[1] * tile))
+    else:
+        y0, y1 = rows
     x0, x1 = int(round(vx - half * tile)), int(round(vx + half * tile))
     if (y1 <= y0 or x1 <= x0 or y0 < 0 or x0 < 0
             or y1 >= bgr.shape[0] or x1 >= bgr.shape[1]):
@@ -2603,15 +2917,19 @@ def _bar_at(sy, origin, u_col, u_row, i, j, dark):
     # gradient suppresses the horizontal one; and the name plate directly above
     # is also a bright horizontal rectangle, so an unconstrained search returns
     # the plate's edges instead -- which reads as a bottom edge *above* the
-    # vertex, something no bar can have. The fixed bands are what prevent that.
+    # vertex, something no bar can have. The bands are what prevent that; the
+    # height constraint is what lets them be loose enough to survive a couple
+    # of px of anchor error (see BAR_HEIGHT).
     t0, t1 = band(*BAR_TOP_BAND)
     b0, b1 = band(*BAR_BOT_BAND)
+    hlo = max(2, int(round(BAR_HEIGHT[0] * tile)))
+    hhi = int(round(BAR_HEIGHT[1] * tile))
     floor = BAR_MIN_EDGE_COLS * 2 * BAR_HALVES[0] * tile
     best = None
     for yt in range(t0, t1 + 1):
         if npos[yt] < floor:
             continue
-        for yb in range(max(b0, yt + 2), b1 + 1):
+        for yb in range(max(b0, yt + hlo), min(b1, yt + hhi) + 1):
             if nneg[yb] >= floor and (best is None
                                       or min(npos[yt], nneg[yb]) > best[0]):
                 best = (min(npos[yt], nneg[yb]), yt, yb)
@@ -2701,13 +3019,24 @@ def detect_population_bars(warped_bgr, wmask, origin, u_col, u_row, n):
                     best = m
             if best is None or best["score"] < BAR_SCORE_MIN:
                 continue
-            # Re-read the color from the preset box matching the width the
-            # geometry just settled on. Still preset -- one of two fixed
-            # rectangles, nothing measured -- but the wider one gives the mode
-            # several times the pixels, and the small box is only ~7 rows tall.
+            # Re-read the color from the bar the geometry just measured, wider
+            # than the prefilter box so the mode gets several times the pixels.
+            # Both halves of that box now come from the detection: the width
+            # class picks the columns, and the measured edges pick the rows.
+            #
+            # The rows are the half that mattered. A preset band's bottom sat a
+            # median 0.012 tile widths inside the bar's bottom edge and *below*
+            # it on four of the 49 labeled bars, so a couple of px of anchor
+            # error walked it onto the white name plate and the mode came back
+            # 252 -- the exact signature this file records for a false
+            # positive. Inset a fifth of the height at each end to stay off the
+            # transition rows.
             wide = BAR_BOX_HALVES[BAR_HALVES.index(best["half"])]
+            by, bh = best["px"][1], best["px"][3]
+            inset = max(1, int(round(0.2 * bh)))
             m2, ok2, _r = _bar_mode(warped_bgr, wmask, origin, u_col, u_row,
-                                    i, j, wide)
+                                    i, j, wide,
+                                    rows=(by + inset, by + bh - inset))
             if m2 is not None and not ok2:
                 continue
             vx, vy = origin + (i + 1) * u_col + (j + 1) * u_row
@@ -2949,7 +3278,105 @@ def load_template(path, dark_thresh, erode_px):
     return bgr, valid_t, edge_t
 
 
-def _probe_basis(dark_thresh):
+_template_cache = {}
+
+
+def template_geometry(path, dark_thresh, erode_px):
+    """One render's pixels plus everything geometric derived from them, once.
+
+    Every consumer of a board render wants the same six things off it, and a
+    run has two consumers: the size pre-pass (_probe_basis) and the merge
+    itself. They ask at different times and used to each pay in full -- a load,
+    a corner fit, an outline and an edge fit, which is 294ms at 20x20 (164 load,
+    42 corners, 72 outline, 17 edge fit).
+
+    Keyed on (path, dark_thresh, erode_px), so a hit is by construction the same
+    computation on the same file and returns the same object. `erode_px` reaches
+    only `valid_t`; `edge_t` is always built un-eroded, which is why the pre-pass
+    can pass the caller's erode_px rather than 0 and share this entry without
+    changing anything it reads.
+
+    Returns None for a render that is not on disk, exactly as load_template
+    does, so the caller still owns the refusal."""
+    key = (path, dark_thresh, erode_px)
+    if key not in _template_cache:
+        bgr, valid_t, edge_t = load_template(path, dark_thresh, erode_px)
+        if bgr is None:
+            _template_cache[key] = None
+        else:
+            corners = detect_corners(edge_t)
+            dirs = edge_directions(corners[0], corners[1], corners[3])
+            _template_cache[key] = {
+                "bgr": bgr, "valid": valid_t, "edge": edge_t,
+                "corners": corners, "dirs": dirs,
+                "edges": edge_lines(board_boundary(edge_t), *dirs),
+            }
+    return _template_cache[key]
+
+
+class ShotCache:
+    """Per-shot measurements several parts of a run all want: the board
+    outline, and the fog's repeat period.
+
+    Both are computed twice today -- once by `detect_map_size` before the board
+    size is known, and again by `anchor_to_template` afterwards -- at ~85-250ms
+    a shot (outline 18-68ms, period 66-186ms). They are the same measurement
+    only when they are made under the same *parameters*, and that is the whole
+    design of this class: **the key carries every input that can change the
+    answer**, so a hit returns the same bits and a miss recomputes exactly what
+    the old code did.
+
+    - the outline depends on the mask and on the projection basis (which reaches
+      `_board_component`'s angle test);
+    - the period depends on the mask, on `dir_a` (the shift direction) and on
+      `tile_px` (which sets the phase of the coarse sweep grid -- see the
+      deferred item on that sensitivity, where a different sweep window moves
+      the answer by up to 0.9%).
+
+    The pre-pass has to pick a template before it knows the size, so it takes
+    those from whichever render `_probe_basis` finds first. That is why the
+    probe order is 20, 18, 16, 14, 11 rather than ascending: on a 20x20 board --
+    the commonest size, and the one this program is most often asked for -- the
+    probe's basis and tile step *are* the ones the anchor will use, every key
+    hits, and the pre-pass becomes free. On any other size nothing hits and the
+    behavior is bit-identical to not having this class at all. It buys the
+    common case and cannot cost the rest.
+
+    A mask is not hashable and identity is not enough (`sky_rebuild` writes new
+    masks into main's dicts in place), so a generation counter per shot stands
+    in for it and `invalidate` bumps it. Getting that wrong would be the one way
+    this could return a stale answer, so it is the caller's single obligation:
+    anything that replaces a shot's masks must invalidate."""
+
+    def __init__(self):
+        self._gen, self._boundary, self._period = {}, {}, {}
+
+    def invalidate(self, name):
+        """Call after replacing a shot's masks; see anchor_to_template."""
+        self._gen[name] = self._gen.get(name, 0) + 1
+
+    def boundary(self, name, mask, dirs):
+        key = (name, self._gen.get(name, 0), dirs[0].tobytes(), dirs[1].tobytes())
+        if key not in self._boundary:
+            self._boundary[key] = board_boundary(mask, dirs)
+        return self._boundary[key]
+
+    def period(self, name, img, valid, hsv, dir_a, tile_px):
+        """(s_it, period_px, ncc) or None -- fog_period_scale's own answer.
+
+        Takes the image rather than its gray conversion so that a hit skips
+        that too -- an argument would be evaluated before the call could return
+        the cached value. The conversion is deliberately not *retained*: one
+        gray frame per shot is ~5.6MB on a large capture and would buy only a
+        ~5ms recompute on the at most two misses a shot can have."""
+        key = (name, self._gen.get(name, 0), dir_a.tobytes(), float(tile_px))
+        if key not in self._period:
+            self._period[key] = fog_period_scale(
+                cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), valid, hsv, dir_a, tile_px)
+        return self._period[key]
+
+
+def _probe_basis(dark_thresh, erode_px=0):
     """The board's projection directions, tile step and per-direction span,
     from any template.
 
@@ -2964,14 +3391,20 @@ def _probe_basis(dark_thresh):
     which is small against EDGE_PAIR_MAX_SPREAD's 3% but not against the
     0.00-1.24% that healthy pairs actually report. Returns None when no
     standard template is on disk."""
-    for n in MAP_SIZE_CHOICES:
-        t, _, edge_t = load_template(template_path_for(n), dark_thresh, 0)
-        if t is None:
+    # Largest first, and this ordering is load-bearing rather than tidy: the
+    # basis and tile step taken here are what ShotCache keys on, so probing the
+    # size a board is most likely to be means the pre-pass's measurements are
+    # the ones the anchor wants and are reused instead of repeated. Descending
+    # from MAP_SIZE_CHOICES rather than a literal list, so a new size cannot
+    # fall out of step with it.
+    for n in sorted(MAP_SIZE_CHOICES, reverse=True):
+        g = template_geometry(template_path_for(n), dark_thresh, erode_px)
+        if g is None:
             continue
-        t_top, t_right, _, t_left, _ = detect_corners(edge_t)
-        dir_a, dir_b = edge_directions(t_top, t_right, t_left)
+        t_top, t_right, _, t_left, _ = g["corners"]
+        dir_a, dir_b = g["dirs"]
         _, u_col, _ = build_lattice(t_top, t_right, t_left, n)
-        t_off, _ = edge_lines(board_boundary(edge_t), dir_a, dir_b)
+        t_off, _ = g["edges"]
         span = [t_off[1] - t_off[0], t_off[3] - t_off[2]]
         return dir_a, dir_b, float(np.linalg.norm(u_col)), span
     return None
@@ -3023,7 +3456,7 @@ def _no_measurement_reason(why):
 
 
 def detect_map_size(names, imgs, edge_mask, valid, hsv, dark_thresh,
-                    min_support, min_scale_support):
+                    min_support, min_scale_support, erode_px=0, cache=None):
     """Measure the board's size off the screenshots themselves.
 
     This is the same quantity the board-size check already computes against a
@@ -3051,10 +3484,13 @@ def detect_map_size(names, imgs, edge_mask, valid, hsv, dark_thresh,
     which is why this raises rather than falling back to a default. A guessed
     size is the most destructive mistake available in this program.
 
-    Costs one edge fit and one fog_period_scale per shot (~0.22s), duplicating
-    work anchor_to_template will do again later. Deliberate: it keeps the
-    registration path untouched. Only ever runs when --map-size is omitted."""
-    basis = _probe_basis(dark_thresh)
+    Costs one edge fit and one fog_period_scale per shot (~0.22s). That used to
+    be duplicated work -- anchor_to_template measures both again -- and `cache`
+    is what reclaims it, on the sizes where the two agree about the parameters
+    they measure under. See ShotCache. Only ever runs when --map-size is
+    omitted."""
+    cache = cache if cache is not None else ShotCache()
+    basis = _probe_basis(dark_thresh, erode_px)
     if basis is None:
         # An install fault, not anything the player did, so the headline says
         # so plainly and the path that identifies it goes on the second line
@@ -3077,7 +3513,7 @@ def detect_map_size(names, imgs, edge_mask, valid, hsv, dark_thresh,
     why = {}
     with PHASES("detect map size"):
         for n in names:
-            pts = board_boundary(edge_mask[n], (dir_a, dir_b))
+            pts = cache.boundary(n, edge_mask[n], (dir_a, dir_b))
             if len(pts) < 100:
                 print(f"  {n}: no board outline -- no size measurement")
                 why[n] = "no-outline"
@@ -3105,8 +3541,7 @@ def detect_map_size(names, imgs, edge_mask, valid, hsv, dark_thresh,
                       f"not span the board, so it cannot count its tiles")
                 why[n] = "no-span"
                 continue
-            got = fog_period_scale(cv2.cvtColor(imgs[n], cv2.COLOR_BGR2GRAY),
-                                   valid[n], hsv[n], dir_a, tile_px)
+            got = cache.period(n, imgs[n], valid[n], hsv[n], dir_a, tile_px)
             if got is None:
                 print(f"  {n}: no periodic fog to measure the tile step "
                       f"against -- no size measurement")
@@ -3364,14 +3799,19 @@ def main():
     # Only when the caller omitted it: an explicit --map-size is always obeyed,
     # so this can never override a size someone actually meant.
     size_was_detected = args.map_size is None
+    # One cache for the whole run, so whatever the size pre-pass measures below
+    # is available to the anchor rather than measured again. See ShotCache.
+    shot_cache = ShotCache()
     if size_was_detected:
         args.map_size = detect_map_size(names, imgs, edge_mask, valid, hsv,
                                         args.dark_thresh, args.min_edge_support,
-                                        args.min_scale_support)
+                                        args.min_scale_support,
+                                        erode_px=args.erode_px,
+                                        cache=shot_cache)
 
     template_path = args.template or template_path_for(args.map_size)
-    template, valid_t, edge_t = load_template(template_path, args.dark_thresh,
-                                              args.erode_px)
+    tgeom = template_geometry(template_path, args.dark_thresh, args.erode_px)
+    template = tgeom["bgr"] if tgeom else None
     if template is None:
         # Install fault, like the missing-Overlays refusal in detect_map_size:
         # nothing the player did, so the path goes below the headline.
@@ -3381,14 +3821,14 @@ def main():
     tmpl_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
     print(f"template: {template_path}")
 
-    t_top, t_right, t_bottom, t_left, t_residual = detect_corners(edge_t)
+    t_top, t_right, t_bottom, t_left, t_residual = tgeom["corners"]
     print(f"template corners: top={tuple(t_top.round(0))} right={tuple(t_right.round(0))} "
           f"bottom={tuple(t_bottom.round(0))} left={tuple(t_left.round(0))} "
           f"(residual {t_residual:.1f}px, should be tiny)")
-    dir_a, dir_b = edge_directions(t_top, t_right, t_left)
+    dir_a, dir_b = tgeom["dirs"]
     origin, u_col, u_row = build_lattice(t_top, t_right, t_left, args.map_size)
     t_corners = (t_top, t_right, t_bottom, t_left)
-    t_edge_off, t_edge_sup = edge_lines(board_boundary(edge_t), dir_a, dir_b)
+    t_edge_off, t_edge_sup = tgeom["edges"]
     tile_px = float(np.linalg.norm(u_col))
     print(f"tile step: {tile_px:.2f}px")
 
@@ -3477,7 +3917,7 @@ def main():
                     dir_a, dir_b, origin, u_col, u_row, args.map_size,
                     args.min_edge_support, n, refine=not args.no_refine,
                     min_scale_support=args.min_scale_support,
-                    sky_rebuild=sky_rebuild_for(n))
+                    sky_rebuild=sky_rebuild_for(n), cache=shot_cache)
                 M_of[n] = M
                 scale_of[n] = float(np.hypot(M[0, 0], M[1, 0]))
                 if implied is not None:
@@ -3538,7 +3978,7 @@ def main():
                         # and m's own anchor converts those to template px
                         zoom_hint=scale_of[m] * k,
                         sky_rebuild=sky_rebuild_for(n),
-                        pan_hint=borrowed)
+                        pan_hint=borrowed, cache=shot_cache)
                     M_of[n] = M
                     scale_of[n] = float(np.hypot(M[0, 0], M[1, 0]))
                     if implied is not None:
