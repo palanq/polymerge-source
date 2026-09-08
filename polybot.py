@@ -88,9 +88,9 @@ MAP_SIZE_NAMES = {11: "tiny", 14: "small", 16: "normal", 18: "large",
 # --overlays. Every one of them is opt-in: a merge nobody asked a question of
 # should hand back the map as the game draws it, and a layer is only wanted by
 # someone who knows what they are reading it for. `shade` was on by default
-# once, which also meant every player had to be told about `noshade` -- a
-# second thing to learn in order to get back to plain output. An empty default
-# costs the player who wants shading one word and costs everyone else nothing.
+# once, and the cost was not the shading but the second word every player then
+# had to learn in order to get back to plain output. An empty default costs the
+# player who wants shading one word and costs everyone else nothing.
 OVERLAY_NAMES = ("shade", "grid", "spawns", "push")
 OVERLAY_DEFAULT = frozenset()
 # One line each, for `!merge help`. Keyed by layer so the help cannot list a
@@ -127,7 +127,7 @@ OVERLAY_ALIASES = {"shading": "shade", "shaded": "shade", "checker": "shade",
 # the docs.
 IMAGE_EXTS = {".jpg", ".jpeg", ".jfif", ".png", ".webp"}
 
-MAX_SHOTS = 8               # a merge should be no more than 6 shots (2 per player in 3v3)
+MAX_SHOTS = 8               # 3v3 with two shots each is 6, so 8 leaves room
 # ...and this is how many *attachments* the bot is willing to download in order
 # to find those 8. The two are different questions, and conflating them was a
 # real refusal: a player reacts a whole post, or a whole game channel, and gets
@@ -148,37 +148,22 @@ MAX_ATTACHMENTS = 3 * MAX_SHOTS
 # the bot is willing to download, not a limit it has to predict -- the
 # attachment is already on Discord's side by the time this is checked.
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
-# Discord's default per-file upload limit: 10 MiB, and it went *down* rather
-# than up -- 25 MiB until 16 January 2025, 10 MiB since (Discord API reference,
-# "Uploading Files", and the change-log entry of 16 December 2024). Higher for a
-# user with Nitro or in a server with a Boost Tier, never lower. Since April
-# 2025 the limit is checked per *attachment* rather than per message, which for
-# this bot is the same thing: it uploads exactly one file.
+# Discord's default per-file upload limit is 10 MiB. **It has gone down as well
+# as up** -- 25 MiB until 16 January 2025 -- so never raise this on the
+# assumption that limits only grow. That assumption once set it to 20 MB, nearly
+# twice what Discord accepts, and stayed invisible because no composite got big
+# enough to reach it.
 #
-# Deliberately one fixed number and not the guild's real limit, which is higher
-# on a boosted server and which discord.py would hand over as
-# Guild.filesize_limit. One bot serves several servers, and this figure is
-# channel-facing copy -- reading it per guild would have the bot quote a
-# different limit in each one. Being conservative on a boosted server costs a
-# re-encode nobody notices.
+# MB, not MiB, and erring low is the point: a composite this accepts cannot be
+# one Discord refuses, and it reports itself back honestly as "10 MB". Erring
+# low costs a re-encode nobody notices; erring high costs a failed upload after
+# the merge has already run.
 #
-# `attachment_size_limit` is a real alternative now and is still not taken. It
-# arrives on the interaction payload and is the honest per-invocation figure --
-# the max of the invoker's Nitro limit and the guild's Boost Tier -- so unlike
-# Guild.filesize_limit it is not an approximation of anything. But it reaches
-# only /merge: a prefix command has no interaction, so !merge would still be
-# guessing. Keying on it would make the limit depend on *how the player typed
-# the command*, and two invocations of the same merge in the same channel could
-# then disagree about how big a composite is allowed. A limit that varies by
-# server is confusing; one that varies by keystroke is indefensible. It is worth
-# revisiting only if !merge is ever retired.
-#
-# MB, not MiB, and erring low is the whole point: 10e6 sits 485,760 bytes under
-# the real 10 MiB cap, so a composite this accepts cannot be one Discord
-# refuses. Erring low costs at most a needless re-encode; erring high costs a
-# failed upload after the merge has already run, which is the worst way to
-# fail. The player-facing message divides by 1e6, so this also reports itself
-# back honestly as "10 MB".
+# **One fixed number, deliberately** -- not Guild.filesize_limit, and not the
+# interaction's attachment_size_limit. This figure is channel-facing copy, one
+# bot serves several guilds, and attachment_size_limit reaches only /merge, so
+# either would make the quoted limit vary by server or by keystroke. See
+# CLAUDE.md before revisiting.
 MAX_UPLOAD_BYTES = 10 * 1000 * 1000
 MERGE_TIMEOUT_S = 300       # a 4-shot merge is ~15-20s; this is a hang guard
 # Longest wait a merge will be allowed to join, in seconds. Merges serialize
@@ -242,12 +227,9 @@ MERGE_LOCK = asyncio.Semaphore(1)
 # _waiting holds one _Queued per merge waiting, carrying the *shot count* rather
 # than just a placeholder, so each can be charged its own size.
 #
-# It used to hold bare shot counts, on the reasoning that only the sum is ever
-# read and so entries with equal counts are interchangeable. That stopped being
-# true when the queue notice started updating live: a waiting merge now has to
-# find its own position in this list, which a bare int cannot supply -- two
-# 3-shot merges are the same int and different places in the queue. Identity is
-# the whole point of the record, so remove by identity, never by value.
+# Remove by identity, never by value: two 3-shot merges are indistinguishable by
+# content and are different places in the queue, and a waiting merge has to find
+# its own position to render its notice. See _Queued.
 _waiting = []               # _Queued, in queue order, not yet started
 _running_shots = None       # shot count of the in-flight merge, None when idle
 _running_since = None       # time.monotonic() when the in-flight merge began
@@ -274,23 +256,17 @@ class _Queued:
 # encode do not scale with the shot count -- and it is what the old
 # purely-proportional model had no way to express.
 #
-# Measured by merging the *same* board's first 1..k shots, which is the only way
-# to separate shot count from board content: archers_test2 fits 1.83 + 4.38n,
-# test_screenshots 1.47 + 4.61n, goon_test 1.22 + 3.65n (that last is 18x18 and
-# cheaper per shot, which is why the seed sits nearer the 20x20 pair -- reading
-# a little high is the safe direction for a wait).
+# **Measure it on one board at a time**, by merging that board's first 1..k
+# shots. Regressing tools/baseline.py across the corpus instead is the obvious
+# move and is confounded: the 2-shot sets are also the cheaper boards, so board
+# content masquerades as shot count and the intercept comes out *negative*. It
+# fits the corpus range well and is nonsense outside it.
 #
-# Do *not* re-derive these by regressing `tools/baseline.py --jobs 1` across the
-# corpus. It looks like the obvious fit and it is confounded: the 2-shot sets are
-# also the cheaper boards, so board content masquerades as shot count and the
-# intercept comes out at -2.3s. It fits n = 2..5 well (R^2 0.92) and is nonsense
-# outside it, predicting 42.5s at MAX_SHOTS against this seed's 36.7s.
-#
-# Two things this seed is not. It is the polymerge subprocess alone, where the
-# bot's own slot hold also covers the attachment downloads, so it reads slightly
-# low. And it was measured on a development machine, not on the deploy host --
-# the container carries no assumption about what it lands on. Both are absorbed
-# by the speed factor below.
+# The seed reads a little high per shot (it is fitted nearer the 20x20 boards),
+# which is the safe direction for a wait estimate, and a little low overall (it
+# times the polymerge subprocess alone, while the slot hold also covers the
+# downloads). It was measured on a development machine, not the deploy host.
+# All three are absorbed by the speed factor below.
 MERGE_FIXED_S = 1.5
 MERGE_PER_SHOT_S = 4.4
 _speed = collections.deque(maxlen=10)   # observed / predicted, one per merge
@@ -316,12 +292,11 @@ def parse_overlays(words):
     Bare words add a layer. Order does not matter and case does not either,
     because this is typed into a chat box rather than a shell.
 
-    Nothing is on by default, so `no`-prefixed words and `plain` have nothing
-    left to remove. They are still parsed, and deliberately no longer
-    advertised: they were needed only while `shade` was on by default, and a
-    player who learned `noshade` then should get a merge rather than an error
-    now. Removing them would turn a once-correct command into an unrecognized
-    word."""
+    There is no way to turn a layer *off*, because nothing is on to begin with.
+    `plain` is still accepted and still clears the set, for the player who
+    learned it while `shade` was a default; a `no`-prefix used to be accepted
+    for the same reason and is not any more, since it could only ever cancel a
+    layer named in the same command."""
     layers = set(OVERLAY_DEFAULT)
     unknown = []
     for raw in words:
@@ -329,13 +304,11 @@ def parse_overlays(words):
         if w in ("plain", "bare", "clean", "nothing"):
             layers.clear()
             continue
-        off = w.startswith("no") and w[2:] not in ("", "ne")
-        stem = w[2:] if off else w
-        stem = OVERLAY_ALIASES.get(stem, stem)
+        stem = OVERLAY_ALIASES.get(w, w)
         if stem not in OVERLAY_NAMES:
             unknown.append(raw)
             continue
-        layers.discard(stem) if off else layers.add(stem)
+        layers.add(stem)
     return layers, unknown
 
 
@@ -491,7 +464,7 @@ def emoji_debug(e):
     return "+".join(f"U{ord(c):04X}" for c in s)
 
 
-async def collect_marked_shots(channel, limit=HISTORY_LIMIT):
+async def collect_marked_shots(channel):
     """(message, attachment) pairs for images someone reacted MARK_EMOJI on,
     oldest first, skipping any the bot has already reacted DONE_EMOJI to (a
     prior merge already consumed them). Reaction state, not the bot process,
@@ -505,9 +478,9 @@ async def collect_marked_shots(channel, limit=HISTORY_LIMIT):
     # that into "start at the beginning of the channel and walk forward", so
     # limit=500 returns the *first* 500 messages the channel ever had, which
     # is no good for long game threads. Take the
-    # most recent `limit` instead, then reverse so shots still merge in
+    # most recent HISTORY_LIMIT instead, then reverse so shots still merge in
     # posting order.
-    recent = [m async for m in channel.history(limit=limit)]
+    recent = [m async for m in channel.history(limit=HISTORY_LIMIT)]
     for message in reversed(recent):
         scanned += 1
         images = [a for a in message.attachments
@@ -584,6 +557,24 @@ def shrink_for_upload(png_path, limit):
     return None
 
 
+def _first_match_int(stdout, pattern):
+    """The captured group of the first stdout line matching `pattern`, as an
+    int, or None. detected_size and size_suspect are this shape exactly,
+    differing only in the pattern."""
+    for line in (stdout or "").splitlines():
+        m = re.match(pattern, line.strip())
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _any_line(stdout, prefix):
+    """Whether any stdout line starts with `prefix`. ruin_sprite_missing and
+    size_unconfirmed are this shape exactly, differing only in the prefix."""
+    return any(line.strip().startswith(prefix)
+               for line in (stdout or "").splitlines())
+
+
 def dropped_shots(stdout):
     """Screenshots polymerge could not place on the board, as (count, names).
 
@@ -623,8 +614,7 @@ def ruin_sprite_missing(stdout):
     claim about the *map* rather than about the bot, and a much stronger one
     than the truth. It means the deployment is missing Assets/ -- see the
     Dockerfile."""
-    return any(line.startswith("NO-RUIN-SPRITE")
-               for line in (stdout or "").splitlines())
+    return _any_line(stdout, "NO-RUIN-SPRITE")
 
 
 def skipped_overlays(stdout):
@@ -648,11 +638,7 @@ def detected_size(stdout):
     supplied themselves, and it is the input whose being wrong ruins a merge
     invisibly. Stating it lets them catch a wrong board before they trust the
     composite. Returns None when the size was supplied."""
-    for line in (stdout or "").splitlines():
-        m = re.match(r"detected map size: (\d+)x\d+", line.strip())
-        if m:
-            return int(m.group(1))
-    return None
+    return _first_match_int(stdout, r"detected map size: (\d+)x\d+")
 
 
 def size_unconfirmed(stdout):
@@ -667,8 +653,7 @@ def size_unconfirmed(stdout):
     more urgently: the merge succeeded and looks entirely normal, and the one
     thing that could have caught a mistyped size is the thing that just came
     back empty. help_text already promises the bot says so."""
-    return any(line.strip().startswith("WARNING: no shot locked onto the fog")
-               for line in (stdout or "").splitlines())
+    return _any_line(stdout, "WARNING: no shot locked onto the fog")
 
 
 def size_suspect(stdout):
@@ -680,11 +665,7 @@ def size_suspect(stdout):
     the same story, not a separate one. Prefer it in the caption when both fire:
     it measures the *harm* an out-of-phase lattice does, where the other reports
     only that the usual check could not run."""
-    for line in (stdout or "").splitlines():
-        m = re.match(r"WARNING: (\d+)% of tiles disagree", line.strip())
-        if m:
-            return int(m.group(1))
-    return None
+    return _first_match_int(stdout, r"WARNING: (\d+)% of tiles disagree")
 
 
 def fog_lock_line(stdout):
@@ -770,16 +751,10 @@ intents = discord.Intents.default()
 # the Discord developer portal, and once the app is verified it has to be
 # *applied* for rather than merely checked.
 #
-# It gates more than the command. MESSAGE_CONTENT covers every user-authored
-# field on a message object -- content, embeds, components, poll, and
-# `attachments` (Discord API docs, Gateway > Message Content Intent) -- so
-# without it both halves of this bot go dark, and they go dark differently.
-# message.content arrives empty, so `!merge` never parses and the command
-# silently never fires; and message.attachments arrives empty on everyone
-# else's messages, so collect_marked_shots walks a thread full of marked
-# screenshots and reports finding none. The second is the one that misleads,
-# because the bot is plainly alive and answering while insisting the shots
-# are not there.
+# It gates more than the command -- MESSAGE_CONTENT covers every user-authored
+# field on a message object, `attachments` included, so without it both halves
+# of this bot go dark differently (see CLAUDE.md for the two failure shapes,
+# one of which is actively misleading rather than silent).
 #
 # Slash commands do *not* relieve this. An interaction carries its own options,
 # but collect_marked_shots reads message.attachments off arbitrary history
@@ -796,25 +771,13 @@ bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 # The help command's name, kept in one place because it is interpolated into
 # channel copy and into /merge's own description.
 #
-# It is deliberately *not* `merge-help`, which was the first name and was a
-# trap: `merge` is a strict prefix of it, so typing `/merge` matched both
-# commands and Enter took whichever Discord had highlighted -- which is ranked
-# by a rule Discord does not document and evidently personalizes per user. That
-# converges on the right answer for someone who merges often and is wrong for
-# someone who has never run either, i.e. exactly the person least able to tell
-# the picker mis-fired.
-#
-# It does NOT escape the collision, which was measured rather than assumed:
-# typing `/merge` in a real guild lists both commands, so the picker matches a
-# *substring* of the command name and "merge" is inside "polymerge-help". A name
-# with no "merge" in it (`polyhelp`) is the only thing that would separate them,
-# and changing this constant is the whole edit.
-#
-# Kept anyway, deliberately: the ranking appears to favor prefixes, so `/merge`
-# sorts above `/polymerge-help` and Enter takes the right one. That is a weaker
-# guarantee than not matching at all -- it rests on an undocumented ordering --
-# but it is the project owner's call, and the explicit name is worth something
-# in a shared server where other apps also register commands.
+# It does NOT separate the two commands in Discord's picker -- "merge" is a
+# substring of "polymerge-help" too, so `/merge` still lists both -- only a
+# name with no "merge" in it (`polyhelp`) would. Kept anyway as the project
+# owner's call: the ranking appears to favor prefixes, so `/merge` sorts above
+# and Enter takes the right one, which is weaker than not colliding at all but
+# was judged worth the explicit name. See CLAUDE.md for the `merge-help` trap
+# this replaced and the measurement behind the "kept anyway" call.
 HELP_COMMAND = "polymerge-help"
 
 # Guild id to sync slash commands to instantly, for development. Global sync is
@@ -836,8 +799,8 @@ async def setup_hook():
     signature lives on Discord's side once synced, so a container running old
     code can leave a command shape published that it no longer implements. That
     is the same failure the Dockerfile's missing Overlays/ produced -- a
-    deployment quietly disagreeing with the source -- which is why on_ready
-    prints what actually synced rather than assuming it worked."""
+    deployment quietly disagreeing with the source -- which is why this prints
+    what actually synced rather than assuming it worked."""
     # Checked before the sync rather than inside it, because setup_hook runs
     # during login: an exception here takes the whole bot down, where a failed
     # sync only costs the slash commands. A guild *name* pasted in place of an
@@ -873,8 +836,8 @@ async def setup_hook():
         # narrow: sync can also raise MissingApplicationID, and a malformed
         # command definition raises TypeError from the library, neither of which
         # should cost the prefix command its deployment. Nothing is swallowed --
-        # the repr goes to stderr, and on_ready's synced-count line is what says
-        # whether the tree actually landed.
+        # the repr goes to stderr, and the synced-count line printed just above
+        # is what says whether the tree actually landed.
         print(f"slash command sync FAILED: {e!r}", file=sys.stderr)
 
 
@@ -898,7 +861,8 @@ async def on_ready():
     # commands however cleanly they synced, and the fix is re-authorizing that
     # guild -- which adds the scope without kicking the bot or resetting its
     # permissions. `{COMMAND_PREFIX}merge` works either way.
-    print(f"  prefix commands: {COMMAND_PREFIX}merge (always available)")
+    print(f"  prefix commands: {COMMAND_PREFIX}merge (needs view_channel in "
+          f"the channel to arrive at all)")
 
 
 # Everything the bot actually needs in a channel, and what breaks without it.
@@ -913,27 +877,13 @@ REQUIRED_PERMS = {
     "read_message_history": "find reacted screenshots",
     "add_reactions": "mark shots as merged",
 }
-# In a thread, SEND_MESSAGES is not the bit that lets the bot post. Threads
-# inherit their parent channel's permissions with exactly one exception, and
-# this is it: "the SEND_MESSAGES permission has no effect in threads; users
-# must have SEND_MESSAGES_IN_THREADS to talk in a thread" (Discord API docs,
-# Threads > Permissions). discord.py's Thread.permissions_for returns the
-# *parent's* value for send_messages untouched, so reading it here answers a
-# question about the wrong channel.
-#
-# That matters most where this report is actually read. A thread is the
-# workflow: the MARK_EMOJI path exists precisely so shots can accumulate in a
-# game thread. Both directions were wrong. With SEND_MESSAGES allowed on the
-# parent and SEND_MESSAGES_IN_THREADS denied, Caller.send's Forbidden handler printed
-# "all required permissions present" -- the console line that is supposed to
-# turn an investigation into a lookup, asserting nothing is wrong. With the
-# parent's SEND_MESSAGES denied but threads allowed, it reported a missing
-# permission the bot did not need and was not in fact missing.
-#
-# discord.py does zero out attach_files when send_messages_in_threads is unset,
-# so the first case was not wholly silent -- but it surfaced as "MISSING
-# attach_files (cannot upload the merged image)", which sends whoever is
-# reading it to the wrong permission entirely.
+# In a thread, SEND_MESSAGES is not the bit that lets the bot post: threads
+# inherit their parent channel's permissions with exactly this one exception
+# (Discord's docs: SEND_MESSAGES "has no effect in threads"), and discord.py's
+# Thread.permissions_for still returns the parent's value for it, so reading
+# that here answers a question about the wrong channel. Getting this wrong
+# breaks the console line meant to turn an investigation into a lookup --
+# see CLAUDE.md for both ways it was wrong in production.
 THREAD_PERM_SWAP = {"send_messages": "send_messages_in_threads"}
 
 
@@ -1242,7 +1192,7 @@ bot.tree.on_error = on_tree_error
 
 
 def help_text():
-    """What the bot says to someone who typed `!merge help`.
+    """The bot's instructions, for `!merge help` and for the slash help command.
 
     Everything variable is interpolated rather than written out, so the text
     cannot drift from the code: the board sizes, the shot limit, the accepted
@@ -1252,7 +1202,7 @@ def help_text():
 
     It is deliberately the *whole* help rather than a pointer to a further
     command: someone who has gone looking for help should not have to ask
-    twice. That costs length -- ~1340 characters against Discord's 2000, so
+    twice. That costs length -- ~1450 characters against Discord's 2000, so
     there is room for a few more bullets and no more. Check len() before
     adding one; the failure is the whole message vanishing, not a truncation.
 
@@ -1263,10 +1213,13 @@ def help_text():
 
     `!merge` on its own does *not* print this -- it attempts a merge, since
     that is what someone who has already attached their shots wants, and the
-    size is measurable without them saying it. The two replies a lost player
-    actually reaches -- an unrecognized size, and no screenshots found -- both
-    name `!merge help`, so it stays one message away from anywhere someone
-    gets stuck.
+    size is measurable without them saying it. The three replies a lost player
+    actually reaches -- an unrecognized layer word, an unrecognized size, and no
+    screenshots found -- all name a route to this text, so it stays one message
+    away from anywhere someone gets stuck. Which route they name differs on
+    purpose: only the last can be reached from `/merge`, so it names the slash
+    help too, and a guild that never authorized slash commands still has one
+    that works.
 
     Symbols the composite can contain are explained here *and*, where they are
     conditional, at the point of use -- the success caption names the ruin
@@ -1281,13 +1234,14 @@ def help_text():
     JPEG_ALIASES = {".jpeg", ".jfif"}
     fmts = ", ".join(sorted(e.lstrip(".") for e in IMAGE_EXTS
                             if e not in JPEG_ALIASES))
-    # The board size is an optional trailing word exactly like the layers are,
-    # and the parser takes it in any position, so it heads the same list rather
-    # than being described apart from them. Both halves are built from the
-    # constants for the same anti-drift reason: a size or a layer the parser
-    # accepts but the help does not name is a feature nobody can find.
-    opts = (f"- `{MAP_SIZES[-1]}` sets the board size (or use {sizes}), which is "
-            f"otherwise measured from the screenshots.\n"
+    # The board size is an optional trailing word exactly like the layers, and
+    # the parser takes it in any position, so it heads the same list rather
+    # than being described apart from them -- see the docstring above for why
+    # both are built from the constants. Not "`20` sets the board size (or use
+    # 11, 14, 16, 18, 20)" -- the example is itself one of the sizes the "or"
+    # then offers, which reads as though it were something else.
+    opts = (f"- A number sets the board size -- one of {sizes}. Otherwise it is "
+            f"measured from the screenshots.\n"
             + "".join(f"- `{n}` shows {OVERLAY_HELP[n]}.\n" for n in OVERLAY_NAMES))
     return (
         f"Usage: `/merge`, or `{COMMAND_PREFIX}merge`. React {MARK_EMOJI} on "
@@ -1303,12 +1257,13 @@ def help_text():
         f"- Works on up to {MAX_SHOTS} shots. Supported formats: {fmts}.\n"
         f"- After the merge runs, the bot reacts {DONE_EMOJI} on the screenshots "
         f"merged, so they won't be merged again.\n"
-        f"- Screenshots should include at least two adjoining board edges.\n"
+        f"- Each screenshot needs two adjoining sides of the board in frame.\n"
         f"- Assumes the top and bottom 15% of screenshots contain UI elements "
         f"and crops them.\n"
         f"- Fog tiles may carry purple outlines for ruins seen in Elyrion "
         f"screenshots.\n"
-        f"- Shots without fog may require a board size input.\n"
+        f"- Shots without fog may need the board size stated. The bot says so "
+        f"when it could not confirm the size it used.\n"
         f"- The merge takes the highest-resolution shot, except it "
         f"deprioritizes tiles with village/ruin capture badges and "
         f"prioritizes tiles with city population bars.\n"
@@ -1350,21 +1305,20 @@ async def merge(ctx, size: str = None, *extras):
         await caller.send(help_text())
         return
 
-    # The size is optional, so are the layers, and neither has to come first.
-    # This is typed into a chat box rather than a shell, so `!merge grid 20`
-    # has to work as well as `!merge 20 grid` -- the help says the layer words
-    # go in any order, and a player will reasonably assume the number does too.
-    # So the size is the first digit-only word wherever it sits, and every
-    # other word is a layer. A stray *second* number is deliberately left in
-    # `words`, so it falls through to parse_overlays and is reported as
-    # unrecognized: `!merge 20 16` is ambiguous, and picking one silently is
-    # the one failure this program cannot afford.
+    # The size is optional, so are the layers, and neither has to come first --
+    # this is typed into a chat box, not a shell, so `!merge grid 20` has to
+    # work as well as `!merge 20 grid`. So the size is the first digit-only
+    # word wherever it sits, and every other word is a layer. A stray *second*
+    # number is deliberately left in `words` and falls through to
+    # parse_overlays as unrecognized, since picking one silently would be
+    # exactly the kind of guess this program cannot afford (see CLAUDE.md).
     #
     # None of this parsing is dead now that /merge exists, and it is not
     # duplicated there: Discord validates typed options itself, so the slash
     # path cannot reach either of the replies below.
     words = ([] if size is None else [size]) + list(extras)
-    at = next((i for i, w in enumerate(words) if w.isdigit()), None)
+    at = next((i for i, w in enumerate(words)
+               if w.isascii() and w.isdigit()), None)
     size = words.pop(at) if at is not None else None
     overlays, bad_layers = parse_overlays(words)
     if bad_layers:
@@ -1384,7 +1338,7 @@ async def merge(ctx, size: str = None, *extras):
     # names it -- which is the moment a confused player actually needs it.
     map_size = None
     if size is not None:
-        if not size.isdigit() or int(size) not in MAP_SIZES:
+        if int(size) not in MAP_SIZES:
             listed = [f"`{n}`" for n in MAP_SIZES]
             await caller.send(
                 f"`{size}` is not a supported board size. {SAD_EMOJI} Use "
@@ -1548,12 +1502,31 @@ async def do_merge(caller, map_size, overlays):
         # refusal reaches the channel the same way every other one does.
         hint = (" Un-react some and try again." if from_history
                 else " Send fewer at a time.")
-        await caller.send(f"Found {len(shots)} screenshots, limit is "
-                          f"{MAX_ATTACHMENTS}. {SAD_EMOJI}{hint}")
+        # Deliberately not "the limit is N screenshots": the help tells the same
+        # player the bot works on up to MAX_SHOTS shots, and two different
+        # numbers for one noun is worse than either alone. This one bounds what
+        # the bot will download to *find* those shots, which is a different
+        # thing, so say that rather than calling it the limit.
+        await caller.send(f"That's {len(shots)} images to look through, and I "
+                          f"only fetch {MAX_ATTACHMENTS} at a time. "
+                          f"{SAD_EMOJI}{hint}")
         return
-    oversized = [a.filename for a in shots if a.size > MAX_ATTACHMENT_BYTES]
+    # Positions, not filenames. Every other reply that has to name a shot goes
+    # through position_of below for one reason: an uploaded filename is
+    # attacker-controlled text echoed into a channel, and this was the last path
+    # that repeated one. Positions are also what the player can act on -- they
+    # can count down their own post, where they may not remember the filenames.
+    # Name the limit too, or "too large" says nothing they can use.
+    oversized = [str(i) for i, a in enumerate(shots, 1)
+                 if a.size > MAX_ATTACHMENT_BYTES]
     if oversized:
-        await caller.send(f"Too large: {', '.join(oversized)} {SAD_EMOJI}")
+        which = ("Image " + oversized[0] if len(oversized) == 1
+                 else "Images " + ", ".join(oversized[:-1]) + " and " + oversized[-1])
+        was = "is" if len(oversized) == 1 else "are"
+        await caller.send(
+            f"{which} of {len(shots)} {was} over the "
+            f"{MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB Discord attachment "
+            f"limit. {SAD_EMOJI} Post a smaller copy and try again.")
         return
 
     # Refuse a wait nobody would sit through, rather than accepting it and
@@ -1576,13 +1549,14 @@ async def do_merge(caller, map_size, overlays):
     note = (f" ({skipped} non-image attachment{'' if skipped == 1 else 's'} ignored)"
              if skipped else "")
     at = f" at {map_size}x{map_size}" if map_size else ""
+    plural = "" if len(shots) == 1 else "s"
 
-    # Recomputed at each use rather than built once, because the estimate can
-    # move between the ack and the edit below -- most sharply over the bot's
-    # first few merges, while the learned speed factor is still replacing the
-    # seed, which is exactly when a queued player is watching this message.
+    # The estimate inside is recomputed at each call rather than built once,
+    # because it can move between the ack and the edit below -- most sharply
+    # over the bot's first few merges, while the learned speed factor is still
+    # replacing the seed, which is exactly when a queued player is watching
+    # this message.
     def starting_text():
-        plural = "" if len(shots) == 1 else "s"
         return (f"Merging {len(shots)} screenshot{plural}{at}{note} -- "
                 f"{human_wait(merge_estimate(len(shots)))}. {WAIT_EMOJI}")
 
@@ -1705,7 +1679,7 @@ async def do_merge(caller, map_size, overlays):
             if smaller is None:
                 await caller.send(reply=False, content=
                     f"The merge worked but the result is {size_bytes / 1e6:.1f} MB "
-                    f"and I couldn't get it under this server's "
+                    f"and I couldn't get it under the "
                     f"{MAX_UPLOAD_BYTES / 1e6:.0f} MB upload limit. {SAD_EMOJI}"
                 )
                 return
@@ -1756,7 +1730,6 @@ async def do_merge(caller, map_size, overlays):
                        f"screenshot needs two adjoining sides of the board "
                        f"in frame.")
         else:
-            plural = "" if len(shots) == 1 else "s"
             caption = (f"Merged {len(shots)} screenshot{plural} in "
                        f"{elapsed:.0f}s. {HAPPY_EMOJI}")
         if map_size is None and found_size:
@@ -1810,8 +1783,8 @@ async def do_merge(caller, map_size, overlays):
         if gone:
             # Plural "boards" rather than "a {n}x{n} board" so the article
             # doesn't have to agree -- "a 11x11" and "an 18x18" both come up.
-            # `gone` itself needs the same treatment: an 11x11 board is missing
-            # three of the four layers, so asking for two of them at once
+            # `gone` itself needs the same treatment: an 11x11 board has no
+            # push or spawns layer, so asking for both at once
             # (`!merge 11 push spawns`) is a real, not hypothetical, case.
             size_txt = f"{found_size or map_size}x{found_size or map_size}"
             layer, exist, it = (("layer", "exists", "it was") if len(gone) == 1
@@ -1842,7 +1815,7 @@ async def do_merge(caller, map_size, overlays):
         # ADD_REACTIONS must not fail a merge that did reach the channel.
         if posted is None:
             if source_messages:
-                print(f"#{ctx.channel}: composite was not delivered, so "
+                print(f"#{caller.channel}: composite was not delivered, so "
                       f"{len(source_messages)} source message(s) are left "
                       f"unmarked and can be merged again", file=sys.stderr)
         else:
