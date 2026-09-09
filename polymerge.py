@@ -476,6 +476,10 @@ def detect_corners(mask):
 BOARD_EDGE_SLOPE = 0.5986            # rise/run of the dir_a family
 BOARD_DIR_A = np.array([1.0, BOARD_EDGE_SLOPE]) / np.hypot(1.0, BOARD_EDGE_SLOPE)
 BOARD_DIR_B = np.array([-BOARD_DIR_A[0], BOARD_DIR_A[1]])
+# The inverse of the (dir_a, dir_b) basis, needed everywhere a pixel offset is
+# read as (a, b) coordinates (edge_lines chief among them). Fixed like the
+# basis itself, so it is computed once here rather than by every caller.
+BOARD_BASIS_INV = np.linalg.inv(np.stack([BOARD_DIR_A, BOARD_DIR_B], axis=1))
 
 
 # Chrome is docked to the screen frame and runs horizontally or vertically; a
@@ -723,13 +727,14 @@ def _line_mode(vals, bw=2.0, smooth=3):
     return float(np.median(vals[sel]))
 
 
-def edge_lines(pts, dir_a, dir_b, windows=(40.0, 15.0, 8.0), tol=3.0):
+def edge_lines(pts, windows=(40.0, 15.0, 8.0), tol=3.0):
     """Fit the four board edges as lines of known direction. Returns their
-    offsets [a_min, a_max, b_min, b_max] in the oblique dir_a/dir_b basis, plus
-    how many boundary points support each.
+    offsets [a_min, a_max, b_min, b_max] in the oblique BOARD_DIR_A/BOARD_DIR_B
+    basis, plus how many boundary points support each.
 
-    The direction of every edge is already known (the camera never rotates), so
-    only the offset is unknown, and it is estimated from the points that
+    The direction of every edge is already known (the camera never rotates --
+    BOARD_DIR_A/BOARD_DIR_B are fixed at every board size and every call site),
+    so only the offset is unknown, and it is estimated from the points that
     actually lie on that edge. That is the point of doing this rather than
     taking a percentile over the silhouette's *area*, which trims a fixed
     fraction of the board's extent and so shrinks the board by a couple of
@@ -738,8 +743,7 @@ def edge_lines(pts, dir_a, dir_b, windows=(40.0, 15.0, 8.0), tol=3.0):
     The support counts are the real output as much as the offsets are: an edge
     that isn't in frame gets a phantom line at the extreme of whatever else was
     there, and only its support count gives it away."""
-    basis_inv = np.linalg.inv(np.stack([dir_a, dir_b], axis=1))
-    ab = pts @ basis_inv.T
+    ab = pts @ BOARD_BASIS_INV.T
     coord = [ab[:, 0], ab[:, 0], ab[:, 1], ab[:, 1]]
     off = [np.percentile(ab[:, 0], 0.5), np.percentile(ab[:, 0], 99.5),
            np.percentile(ab[:, 1], 0.5), np.percentile(ab[:, 1], 99.5)]
@@ -1589,7 +1593,7 @@ def anchor_to_template(img, mask, valid, hsv, tmpl_gray, t_off, dir_a, dir_b,
             pts = cache.boundary(label, m, (dir_a, dir_b))
             if len(pts) < 100:
                 return pts, None, None, False
-            off, support = edge_lines(pts, dir_a, dir_b)
+            off, support = edge_lines(pts)
         have = [c >= min_support for c in support]
         print(f"  board edges ({len(pts)} boundary px): " + "  ".join(
             f"{t}={'ok' if h else 'MISSING'}({c})"
@@ -3212,7 +3216,7 @@ def template_geometry(path, dark_thresh, erode_px):
             _template_cache[key] = {
                 "bgr": bgr, "valid": valid_t, "edge": edge_t,
                 "corners": corners, "dirs": dirs,
-                "edges": edge_lines(board_boundary(edge_t), *dirs),
+                "edges": edge_lines(board_boundary(edge_t)),
             }
     return _template_cache[key]
 
@@ -3421,7 +3425,7 @@ def detect_map_size(names, imgs, edge_mask, valid, hsv, dark_thresh,
                 print(f"  {n}: no board outline -- no size measurement")
                 why[n] = "no-outline"
                 continue
-            off, support = edge_lines(pts, dir_a, dir_b)
+            off, support = edge_lines(pts)
             have = [c >= min_scale_support for c in support]
             pairs = [(k, lo, hi) for k, (lo, hi) in enumerate([(0, 1), (2, 3)])
                      if have[lo] and have[hi]]
