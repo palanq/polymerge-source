@@ -3095,7 +3095,7 @@ def overlay_layer_path(n, stem):
     the filename -- <name>-2spawns.png is a 2x2 grid of 4 zones and
     <name>-3spawns.png a 3x3 of 9. That digit is a property of the board size,
     so it is matched rather than assumed. Not every size has every layer:
-    massive has no layers at all and tiny has neither push nor spawns."""
+    massive has no layers at all and tiny has no spawns layer."""
     name = BOARD_SIZE_NAMES.get(n)
     if name is None:
         return None
