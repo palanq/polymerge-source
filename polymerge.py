@@ -678,13 +678,29 @@ def board_region(mask, dirs, open_px=15, close_px=15):
     return _board_component(m, dirs)
 
 
-def board_boundary(mask, dirs=None, frame_margin=10, open_px=15, close_px=15):
+def board_boundary(mask, dirs=None, frame_margin=10, open_px=15, close_px=15,
+                   top_crop=0.0, bottom_crop=0.0):
     """The board's silhouette outline within one image, as an (N,2) point array.
 
     Interior holes (UI cut-outs, dark terrain) are filled so they cannot emit
     boundary points, detached chrome is dropped (see _board_component), and
     stretches that merely follow the image frame are dropped too -- those are
     where the photo ran out, not where the board ends.
+
+    `top_crop`/`bottom_crop` extend that same reasoning to `--top-crop`/
+    `--bottom-crop`: those blank out interior rows before this function ever
+    sees the mask, so on a shot with little margin above the board the crop's
+    own cut line sits well inside the frame rather than at row 0/h-1, and
+    without this the frame-margin check has no way to know it is there. A
+    straight horizontal cut is not at the board's fixed 30.9deg/149.1deg
+    edge angle, so edge_lines cannot mistake it for a board edge directly --
+    but it still shows up as boundary points, gets bucketed into whichever
+    real edge direction is nearest, and (because a horizontal line only
+    grazes a diagonal one over a few pixels near where they cross) can leave
+    a small, misleadingly nonzero support count for an edge that was in fact
+    entirely cropped away. Passing the same crop the mask was built with
+    drops those points instead of letting them masquerade as a weak real
+    edge.
 
     The cleanup is an open *and* a close, and it must be that pair rather than
     an erosion: both operations leave a straight half-plane exactly where it
@@ -707,8 +723,10 @@ def board_boundary(mask, dirs=None, frame_margin=10, open_px=15, close_px=15):
     bnd = cv2.subtract(filled, cv2.erode(filled, np.ones((3, 3), np.uint8)))
     h, w = mask.shape
     ys, xs = np.where(bnd > 0)
-    keep = ((xs > frame_margin) & (ys > frame_margin) &
-            (xs < w - 1 - frame_margin) & (ys < h - 1 - frame_margin))
+    top = int(round(h * top_crop))
+    bot = h - int(round(h * bottom_crop))
+    keep = ((xs > frame_margin) & (ys > top + frame_margin) &
+            (xs < w - 1 - frame_margin) & (ys < bot - 1 - frame_margin))
     return np.stack([xs[keep], ys[keep]], axis=1).astype(np.float64)
 
 
@@ -826,6 +844,19 @@ def _masked_shift_ncc(gray, fogish, dx, dy, min_overlap):
 # monotonically from the shortest shift.
 PERIOD_MIN_PROMINENCE = 0.10
 
+# The smallest-period rule (below) assumes the first candidate that clears
+# min_ncc/PERIOD_MIN_PROMINENCE is trustworthy, and that assumption can fail:
+# a shift that isn't the tile period at all can still produce a shallow local
+# wobble that just barely clears both bars before the scan ever reaches the
+# real, far stronger peak. Every genuine period this file documents scores
+# >= 0.68 (xizauh 0.68, basin_treaties 0.72, hood.png 0.92); a peak weaker
+# than this is not trusted to stop the search on its own, and a stronger,
+# later peak is preferred over it. Peaks are still scanned smallest-first
+# among those that clear it -- this does not touch the missized_test/z2.png
+# case (fundamental 0.68 correctly preferred over its stronger 0.83 harmonic),
+# since 0.68 already clears the bar and nothing later is being compared to it.
+PERIOD_PEAK_MIN_NCC = 0.65
+
 
 def _peak_parabola(ts, ss, k):
     if 0 < k < len(ss) - 1 and (ss[k - 1] - 2 * ss[k] + ss[k + 1]) < 0:
@@ -906,7 +937,13 @@ def fog_period_scale(gray, valid, hsv, dir_a, tile_px,
              and ss[i] - float(ss[:i].min()) >= PERIOD_MIN_PROMINENCE]
     if not peaks:
         return None
-    k = peaks[0]              # smallest period: the fundamental, not a harmonic
+    # Smallest period among the *trustworthy* peaks, not smallest overall --
+    # see PERIOD_PEAK_MIN_NCC. A peak that only just clears min_ncc/prominence
+    # can be a coincidental wobble rather than the real lattice; fall back to
+    # the old smallest-of-all-peaks behavior only if none clears the higher
+    # bar, so this can never produce an answer where there wasn't one before.
+    strong = [i for i in peaks if ss[i] >= PERIOD_PEAK_MIN_NCC]
+    k = strong[0] if strong else peaks[0]  # fundamental, not a harmonic
     t0 = ts[k]
     fine = []
     for t in np.arange(t0 - q - 1, t0 + q + 1 + 1e-9, 1.0):
@@ -1517,7 +1554,8 @@ LONE_PAIR_EXTENT_HI = 1.15
 def anchor_to_template(img, mask, valid, hsv, tmpl_gray, t_off, dir_a, dir_b,
                        origin, u_col, u_row, n_tiles, min_support, label,
                        refine=True, min_scale_support=30, zoom_hint=None,
-                       sky_rebuild=None, pan_hint=None, cache=None):
+                       sky_rebuild=None, pan_hint=None, cache=None,
+                       top_crop=0.0, bottom_crop=0.0):
     """Map one image onto the template.
 
     The board edges supply the starting estimate for both zoom and pan, and
@@ -1568,7 +1606,12 @@ def anchor_to_template(img, mask, valid, hsv, tmpl_gray, t_off, dir_a, dir_b,
     "fog-period", so the caller can hold fog-period-anchored shots to the extra
     fog-lock check that their anchoring path warrants. implied_n is this shot's
     own independent estimate of the board size, or None -- see
-    BOARD_SPAN_WALL_TILES and the map-size check in main."""
+    BOARD_SPAN_WALL_TILES and the map-size check in main.
+
+    `top_crop`/`bottom_crop` must be the same values `mask` was already built
+    with -- they change nothing about the mask here, only tell board_boundary
+    where its own cut line falls, so a phantom edge fitted to that cut is not
+    mistaken for a weak real one (see board_boundary)."""
     # t_off is the *template's* four edge offsets, fitted by the same
     # board_boundary/edge_lines pair used below. It deliberately is not derived
     # from the tile-grid corners: a screenshot's silhouette edge includes the
@@ -1590,7 +1633,7 @@ def anchor_to_template(img, mask, valid, hsv, tmpl_gray, t_off, dir_a, dir_b,
 
     def fit_edges(m):
         with PHASES("anchor: board outline + edge fit"):
-            pts = cache.boundary(label, m, (dir_a, dir_b))
+            pts = cache.boundary(label, m, (dir_a, dir_b), top_crop, bottom_crop)
             if len(pts) < 100:
                 return pts, None, None, False
             off, support = edge_lines(pts)
@@ -3236,8 +3279,10 @@ class ShotCache:
     answer**, so a hit returns the same bits and a miss recomputes exactly what
     the old code did.
 
-    - the outline depends on the mask and on the projection basis (which reaches
-      `_board_component`'s angle test);
+    - the outline depends on the mask, on the projection basis (which reaches
+      `_board_component`'s angle test), and on `--top-crop`/`--bottom-crop`
+      (which tells it where the crop's own cut line falls, so points along
+      that line are not mistaken for a weak real edge -- see board_boundary);
     - the period depends on the mask, on `dir_a` (the shift direction) and on
       `tile_px` (which sets the phase of the coarse sweep grid -- see the
       deferred item on that sensitivity, where a different sweep window moves
@@ -3265,10 +3310,12 @@ class ShotCache:
         """Call after replacing a shot's masks; see anchor_to_template."""
         self._gen[name] = self._gen.get(name, 0) + 1
 
-    def boundary(self, name, mask, dirs):
-        key = (name, self._gen.get(name, 0), dirs[0].tobytes(), dirs[1].tobytes())
+    def boundary(self, name, mask, dirs, top_crop=0.0, bottom_crop=0.0):
+        key = (name, self._gen.get(name, 0), dirs[0].tobytes(), dirs[1].tobytes(),
+               top_crop, bottom_crop)
         if key not in self._boundary:
-            self._boundary[key] = board_boundary(mask, dirs)
+            self._boundary[key] = board_boundary(mask, dirs, top_crop=top_crop,
+                                                 bottom_crop=bottom_crop)
         return self._boundary[key]
 
     def period(self, name, img, valid, hsv, dir_a, tile_px):
@@ -3565,7 +3612,8 @@ def _no_measurement_reason(why):
 
 
 def detect_map_size(names, imgs, edge_mask, valid, hsv, dark_thresh,
-                    min_support, min_scale_support, erode_px=0, cache=None):
+                    min_support, min_scale_support, erode_px=0, cache=None,
+                    top_crop=0.0, bottom_crop=0.0):
     """Measure the board's size off the screenshots themselves.
 
     This is the same quantity the board-size check already computes against a
@@ -3597,7 +3645,12 @@ def detect_map_size(names, imgs, edge_mask, valid, hsv, dark_thresh,
     be duplicated work -- anchor_to_template measures both again -- and `cache`
     is what reclaims it, on the sizes where the two agree about the parameters
     they measure under. See ShotCache. Only ever runs when --map-size is
-    omitted."""
+    omitted.
+
+    `edge_mask` already has `--top-crop`/`--bottom-crop` baked in (see
+    Shot.build_masks); `top_crop`/`bottom_crop` here must be the same values,
+    so board_boundary can tell its own cut line apart from a real edge
+    instead of reading it as a weak one -- see board_boundary."""
     cache = cache if cache is not None else ShotCache()
     basis = _probe_basis(dark_thresh, erode_px)
     if basis is None:
@@ -3622,7 +3675,7 @@ def detect_map_size(names, imgs, edge_mask, valid, hsv, dark_thresh,
     why = {}
     with PHASES("detect map size"):
         for n in names:
-            pts = cache.boundary(n, edge_mask[n], (dir_a, dir_b))
+            pts = cache.boundary(n, edge_mask[n], (dir_a, dir_b), top_crop, bottom_crop)
             if len(pts) < 100:
                 print(f"  {n}: no board outline -- no size measurement")
                 why[n] = "no-outline"
@@ -3956,7 +4009,8 @@ def main():
             args.dark_thresh, args.min_edge_support,
             args.min_scale_support,
             erode_px=args.erode_px,
-            cache=shot_cache)
+            cache=shot_cache,
+            top_crop=args.top_crop, bottom_crop=args.bottom_crop)
 
     template_path = args.template or template_path_for(args.map_size)
     tgeom = template_geometry(template_path, args.dark_thresh, args.erode_px)
@@ -4024,7 +4078,8 @@ def main():
                     dir_a, dir_b, origin, u_col, u_row, args.map_size,
                     args.min_edge_support, n, refine=not args.no_refine,
                     min_scale_support=args.min_scale_support,
-                    sky_rebuild=sky_rebuild_for(n), cache=shot_cache)
+                    sky_rebuild=sky_rebuild_for(n), cache=shot_cache,
+                    top_crop=args.top_crop, bottom_crop=args.bottom_crop)
                 _record(n, M, implied)
             except SystemExit as e:
                 print(f"  no self-anchor: {e}")
@@ -4083,7 +4138,8 @@ def main():
                         # and m's own anchor converts those to template px
                         zoom_hint=scale_of[m] * k,
                         sky_rebuild=sky_rebuild_for(n),
-                        pan_hint=borrowed, cache=shot_cache)
+                        pan_hint=borrowed, cache=shot_cache,
+                        top_crop=args.top_crop, bottom_crop=args.bottom_crop)
                     _record(n, M, implied)
                     failed.remove(n)
                 except SystemExit as e:
