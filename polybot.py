@@ -641,6 +641,18 @@ def detected_size(stdout):
     return _first_match_int(stdout, r"detected map size: (\d+)x\d+")
 
 
+def base_size(stdout):
+    """The board size polymerge read off --base's own pixel dimensions.
+
+    A third possible source of the size alongside a player-stated one and a
+    detected one -- on a /merge-update run the size came from neither, so
+    without this `used_size` renders "NonexNone" in the console log and the
+    size-warning captions. Distinct from detected_size's own regex: that
+    phrase means a specific thing (span/fog-period measurement across
+    screenshots) which is not what happened here."""
+    return _first_match_int(stdout, r"base map size: (\d+)x\d+")
+
+
 def size_unconfirmed(stdout):
     """True when polymerge merged at a stated size that nothing could confirm.
 
@@ -683,7 +695,8 @@ def fog_lock_line(stdout):
     return None
 
 
-async def run_polymerge(workdir, image_paths, map_size, out_path, overlays=None):
+async def run_polymerge(workdir, image_paths, map_size, out_path, overlays=None,
+                        base=None):
     """Returns (returncode, stdout, stderr). Never raises on merge failure.
 
     `map_size` of None omits the flag, which asks polymerge to measure the
@@ -691,6 +704,12 @@ async def run_polymerge(workdir, image_paths, map_size, out_path, overlays=None)
     size there is no template to name, and polymerge picks its own once it has
     measured. It refuses rather than guessing when the shots cannot answer, so
     None can never become a silently wrong size.
+
+    `base` is a prior composite's path, used only by /merge-update. When set,
+    polymerge places it as the paste canvas's own starting pixels and reads
+    the board size off its exact pixel dimensions if `map_size` was not also
+    given -- so `map_size=None, base=<path>` is a normal and common
+    combination here, not a special case either side needs to reason about.
 
     `overlays` is a set and is always passed explicitly by the command path --
     an empty one becomes `--overlays none`. The None default here omits the flag
@@ -714,6 +733,7 @@ async def run_polymerge(workdir, image_paths, map_size, out_path, overlays=None)
         *[str(p) for p in image_paths],
         *([] if map_size is None else
           ["--map-size", str(map_size), "--template", str(template_for(map_size))]),
+        *([] if base is None else ["--base", str(base)]),
         *([] if layers is None else ["--overlays", layers]),
         "-o", str(out_path),
         # Always on: with no Elyrion shot in the batch it detects nothing
@@ -966,12 +986,14 @@ class Caller:
                    ctx=ctx)
 
     @classmethod
-    def from_interaction(cls, interaction):
-        # No attachments, ever: /merge is reactions-only. A slash command has
-        # no variadic attachment option, so parity with !merge's drag-and-drop
+    def from_interaction(cls, interaction, attachments=()):
+        # Empty for /merge, which is reactions-only: a slash command has no
+        # variadic attachment option, so parity with !merge's drag-and-drop
         # would mean MAX_SHOTS separate option slots and one file picker each.
+        # /merge-update passes its own fixed, small set of shot attachments
+        # instead, which costs exactly that many named slots.
         return cls(interaction.channel, interaction.guild, interaction.user,
-                   [], interaction=interaction)
+                   list(attachments), interaction=interaction)
 
     @property
     def can_attach(self):
@@ -1267,6 +1289,9 @@ def help_text():
         f"- The merge takes the highest-resolution shot, except it "
         f"deprioritizes tiles with village/ruin capture badges and "
         f"prioritizes tiles with city population bars.\n"
+        f"- `/merge-update` merges screenshots you attach directly; attach a "
+        f"map this bot posted earlier as its `base` to update it instead of "
+        f"starting fresh.\n"
         f"\n"
         f"Credits: Made by palanq, with support from our robot overlords and "
         f"the ArcticWolves team. {CREDIT_EMOJI}"
@@ -1400,6 +1425,61 @@ async def merge_slash(interaction: discord.Interaction,
     await do_merge(caller, size.value if size else None, layers)
 
 
+@bot.tree.command(
+    name="merge-update",
+    description="Merge screenshots directly, optionally updating a prior map",
+)
+@app_commands.choices(size=[
+    app_commands.Choice(name=f"{n}x{n} ({MAP_SIZE_NAMES[n]})", value=n)
+    for n in MAP_SIZES
+])
+@app_commands.describe(
+    new="A new screenshot to merge or fold in.",
+    base="A prior map this bot posted, to update instead of starting fresh.",
+    size="Board size. Leave blank to measure it (or read it off `base`).",
+    new2="A second new screenshot, if you have one.",
+    new3="A third new screenshot, if you have one.",
+)
+async def merge_update_slash(interaction: discord.Interaction,
+                             new: discord.Attachment,
+                             base: typing.Optional[discord.Attachment] = None,
+                             size: typing.Optional[app_commands.Choice[int]] = None,
+                             new2: typing.Optional[discord.Attachment] = None,
+                             new3: typing.Optional[discord.Attachment] = None):
+    """A standalone command, deliberately not folded into /merge as a
+    subcommand of it: Discord gives a command options or subcommands, never
+    both, so adding this under /merge would have meant turning the existing,
+    working reaction workflow into /merge something-else to make room. This
+    costs a picker collision instead -- typing /merge lists this command too,
+    since Discord matches by substring the same way it does for
+    /polymerge-help -- accepted for now rather than reworked.
+
+    Takes its shots as direct attachments rather than through the MARK_EMOJI
+    reaction workflow, which is what makes `base` possible in the first
+    place: a previous merge's own output is not a screenshot anyone would
+    react to. Omitting `base` makes this an ordinary direct-attach merge --
+    the same job /merge already does, reached a different way -- and `size`
+    behaves exactly as it does there (blank measures it). Supplying `base`
+    updates that composite instead of starting from blank fog, and `size` is
+    then normally left blank too, since the base's own pixel dimensions name
+    the board exactly (see polymerge's base_output_size)."""
+    shots = [a for a in (new, new2, new3) if a is not None]
+    bad = [a.filename for a in shots + ([base] if base else [])
+           if pathlib.Path(a.filename).suffix.lower() not in IMAGE_EXTS]
+    if bad:
+        await interaction.response.send_message(
+            f"That doesn't look like a supported image: {', '.join(bad)}. "
+            f"{SAD_EMOJI}", ephemeral=True)
+        return
+    # Same three-second reasoning as /merge: defer before anything slower.
+    await interaction.response.defer(ephemeral=True)
+    caller = Caller.from_interaction(interaction, attachments=shots)
+    log_invocation(caller, f"/merge-update {size.value if size else None} "
+                           f"base={base is not None}")
+    await do_merge(caller, size.value if size else None, OVERLAY_DEFAULT,
+                   base=base)
+
+
 @bot.tree.command(name=HELP_COMMAND,
                   description="How to use the merge bot")
 async def merge_help_slash(interaction: discord.Interaction):
@@ -1416,13 +1496,24 @@ async def merge_help_slash(interaction: discord.Interaction):
     await interaction.response.send_message(help_text(), ephemeral=True)
 
 
-async def do_merge(caller, map_size, overlays):
+async def do_merge(caller, map_size, overlays, base=None):
     """Run one merge and report it, however the merge was asked for.
 
-    Shared by both front ends, which is what puts them on one queue: MERGE_LOCK,
-    _waiting, _running_* and merge_speed are module state reached only through
-    here, so a /merge queues behind a !merge and wait_estimate covers both. Do
-    not give either front end its own path to the semaphore."""
+    Shared by every front end, which is what puts them on one queue:
+    MERGE_LOCK, _waiting, _running_* and merge_speed are module state reached
+    only through here, so a /merge-update queues behind a !merge and
+    wait_estimate covers all of them. Do not give any front end its own path
+    to the semaphore.
+
+    `base` is /merge-update's optional prior-composite attachment. It changes
+    three things and nothing else: it is downloaded alongside the shots and
+    passed to polymerge as --base; the board size may come from it instead of
+    from map_size/detection (see used_size below); and the ack/caption wording
+    says "updating" rather than "merging". /merge-update always supplies its
+    own attachments (`new`/`new2`/`new3`), so `caller.attachments` is already
+    non-empty here regardless of `base` -- the reaction-history scan below is
+    unreachable from that command, the same way it already is for `!merge`
+    with files attached."""
     global _running_shots, _running_since
 
     # Both of these are install faults, so the channel gets the consequence in
@@ -1528,6 +1619,14 @@ async def do_merge(caller, map_size, overlays):
             f"{MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB Discord attachment "
             f"limit. {SAD_EMOJI} Post a smaller copy and try again.")
         return
+    # A second downloaded attachment the check above doesn't cover -- it only
+    # bounds `shots`.
+    if base is not None and base.size > MAX_ATTACHMENT_BYTES:
+        await caller.send(
+            f"The base image is over the "
+            f"{MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB Discord attachment "
+            f"limit. {SAD_EMOJI} Post a smaller copy and try again.")
+        return
 
     # Refuse a wait nobody would sit through, rather than accepting it and
     # going quiet. The queue is unbounded and merges are serialized across
@@ -1557,7 +1656,10 @@ async def do_merge(caller, map_size, overlays):
     # replacing the seed, which is exactly when a queued player is watching
     # this message.
     def starting_text():
-        return (f"Merging {len(shots)} screenshot{plural}{at}{note} -- "
+        what = (f"Updating the map with {len(shots)} new screenshot{plural}"
+                if base is not None
+                else f"Merging {len(shots)} screenshot{plural}{at}")
+        return (f"{what}{note} -- "
                 f"{human_wait(merge_estimate(len(shots)))}. {WAIT_EMOJI}")
 
     rec = _Queued(len(shots))
@@ -1611,10 +1713,20 @@ async def do_merge(caller, map_size, overlays):
                     paths.append(p)
                     position_of[p.name] = i + 1
 
+                base_path = None
+                if base is not None:
+                    # A fixed name, not safe_name-indexed -- it is never one
+                    # of the counted "shots", so it needs no position_of
+                    # entry. The suffix is kept because cv2.imread goes by it.
+                    base_path = workdir / (
+                        "base" + pathlib.Path(base.filename).suffix.lower())
+                    await base.save(base_path)
+
                 out_path = workdir / "merged.png"
                 t0 = time.monotonic()
                 rc, stdout, stderr = await run_polymerge(
-                    workdir, paths, map_size, out_path, overlays)
+                    workdir, paths, map_size, out_path, overlays,
+                    base=base_path)
                 elapsed = time.monotonic() - t0
         finally:
             # Slot-hold time, not `elapsed`: the estimate is answering "when
@@ -1646,6 +1758,11 @@ async def do_merge(caller, map_size, overlays):
             # file). Those messages are written for a human, so pass them
             # through rather than replacing them with a generic failure.
             detail = tail(stderr) or tail(stdout) or "no output"
+            # base_path is also a server-side temp path, same reasoning as the
+            # per-shot names below -- scrub it before either substitution loop
+            # runs, since it never appears in position_of.
+            if base_path is not None:
+                detail = detail.replace(str(base_path), "the base image")
             # polymerge only knows the index-prefixed safe names. Swap them
             # for positions before this reaches the channel, so the bot never
             # repeats a user-supplied filename. Longest first, so "10_a.jpg"
@@ -1689,11 +1806,18 @@ async def do_merge(caller, map_size, overlays):
         # one number that distinguishes a correct merge from a silently wrong
         # one, so it is worth keeping, but it means nothing to a player.
         found_size = detected_size(stdout)
-        used_size = map_size or found_size
+        # base_size last, and it is the only one set on an update merge --
+        # there the size came from neither the player nor the screenshots.
+        # Without it this renders "NonexNone" in both the console line below
+        # and the size-warning captions further down.
+        from_base_size = base_size(stdout) if base is not None else None
+        used_size = map_size or found_size or from_base_size
         lock = fog_lock_line(stdout)
         if lock:
+            kind = (" (detected)" if map_size is None and from_base_size is None
+                    else " (from base)" if from_base_size is not None else "")
             print(f"#{caller.channel} merged {len(shots)} at {used_size}"
-                  + (" (detected)" if map_size is None else "") + f": {lock}")
+                  f"{kind}: {lock}")
         for line in (stdout or "").splitlines():
             # Same console-not-channel reasoning as fog lock: which shots got
             # dropped as misanchored and what ruin markers were found matter
@@ -1729,6 +1853,9 @@ async def do_merge(caller, map_size, overlays):
                        f"Merged the other {used} in {elapsed:.0f}s. A "
                        f"screenshot needs two adjoining sides of the board "
                        f"in frame.")
+        elif base is not None:
+            caption = (f"Updated the map with {len(shots)} new "
+                       f"screenshot{plural} in {elapsed:.0f}s. {HAPPY_EMOJI}")
         else:
             caption = (f"Merged {len(shots)} screenshot{plural} in "
                        f"{elapsed:.0f}s. {HAPPY_EMOJI}")
@@ -1740,6 +1867,13 @@ async def do_merge(caller, map_size, overlays):
             # the bot has a second guess when it does not.
             caption += (f" Board measured as {found_size}x{found_size}."
                         f" Remerge including map size if that's wrong.")
+        elif map_size is None and from_base_size:
+            # The board size an update merge reads off the base image itself
+            # -- exact, not a measurement, so this is informative rather than
+            # a "remerge if wrong" hedge the way the detected-size clause
+            # above is.
+            caption += (f" Board size: {from_base_size}x{from_base_size} "
+                        f"(read from the base image).")
 
         # Mutually exclusive with the clause above, by construction: both of
         # polymerge's size warnings need a size the *player* stated, since a
@@ -1786,7 +1920,7 @@ async def do_merge(caller, map_size, overlays):
             # `gone` itself needs the same treatment: an 11x11 board has no
             # push or spawns layer, so asking for both at once
             # (`!merge 11 push spawns`) is a real, not hypothetical, case.
-            size_txt = f"{found_size or map_size}x{found_size or map_size}"
+            size_txt = f"{used_size}x{used_size}"
             layer, exist, it = (("layer", "exists", "it was") if len(gone) == 1
                                 else ("layers", "exist", "they were"))
             caption += (f" No {' or '.join(gone)} {layer} {exist} for {size_txt} "

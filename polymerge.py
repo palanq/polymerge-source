@@ -3267,6 +3267,54 @@ def template_geometry(path, dark_thresh, erode_px):
     return _template_cache[key]
 
 
+def output_crop(origin, u_col, u_row, n, W, Hc, pad=10):
+    """The exact pixel rectangle main() crops the canvas to before writing
+    the composite -- factored out of the tail of main() so --base's size
+    check and detection (base_output_size, below) can share the exact
+    arithmetic that decides a finished composite's on-disk dimensions,
+    rather than risk drifting from it."""
+    full = np.float32([origin, origin + n * u_col,
+                       origin + n * u_col + n * u_row, origin + n * u_row])
+    x0c, y0c = np.floor(full.min(0)).astype(int)
+    x1c, y1c = np.ceil(full.max(0)).astype(int)
+    x0c, y0c = max(x0c - pad, 0), max(y0c - pad, 0)
+    x1c, y1c = min(x1c + pad, W), min(y1c + pad, Hc)
+    return x0c, y0c, x1c, y1c
+
+
+def base_output_size(shape_hw, dark_thresh, erode_px):
+    """Which board size's own composite has exactly these pixel dimensions,
+    or None if none does.
+
+    A finished composite's size is a pure function of board geometry
+    (output_crop), so this is a fact about which board it is, not an
+    estimate -- exact match only, deliberately. An 18x18 composite scaled
+    ~1.1x lands within a pixel of 20x20's own native size, so a near-match
+    would silently pick the wrong board; a resized or re-encoded --base is
+    refused by its caller instead of guessed at.
+
+    Largest first, matching _probe_basis's own precedent and for the same
+    reason: most merges are 20x20, so checking it first makes the common
+    case load exactly one template geometry -- the same one the real merge
+    loads moments later via template_geometry's cache, so it costs nothing
+    extra there either."""
+    h, w = shape_hw
+    hit = None
+    for n in sorted(MAP_SIZE_CHOICES, reverse=True):
+        tgeom = template_geometry(template_path_for(n), dark_thresh, erode_px)
+        if tgeom is None:
+            continue
+        t_top, t_right, _t_bottom, t_left, _res = tgeom["corners"]
+        origin, u_col, u_row = build_lattice(t_top, t_right, t_left, n)
+        Wt, Ht = tgeom["bgr"].shape[1], tgeom["bgr"].shape[0]
+        x0c, y0c, x1c, y1c = output_crop(origin, u_col, u_row, n, Wt, Ht)
+        if (x1c - x0c, y1c - y0c) == (w, h):
+            if hit is not None:
+                return None  # ambiguous -- refuse rather than guess
+            hit = n
+    return hit
+
+
 class ShotCache:
     """Per-shot measurements several parts of a run all want: the board
     outline, and the fog's repeat period.
@@ -3836,6 +3884,14 @@ def main():
     ap.add_argument("--template", help="blank all-fog board render to register "
                     "against and use as the fog base layer (default: "
                     "Overlays/<size-name>-blank.png -- see template_path_for)")
+    ap.add_argument("--base", help="a composite this program wrote earlier, "
+                    "used as the paste canvas's starting pixels instead of "
+                    "blank template fog, so a new screenshot can extend it "
+                    "without resupplying the shots it was built from. Must "
+                    "be this program's own, unmodified output -- its pixel "
+                    "dimensions name the board size exactly (see "
+                    "base_output_size), and a resized or re-encoded copy is "
+                    "refused rather than guessed at.")
     ap.add_argument("--fog-ncc", type=float, default=0.4,
                     help="a tile counts as fog when it correlates at least this "
                          "well with the template's fog art. Measured on a real "
@@ -3913,7 +3969,17 @@ def main():
     args = ap.parse_args()
 
     if args.overlays is None:
-        args.overlays = OVERLAY_DEFAULT
+        # --base's own default is "none", not OVERLAY_DEFAULT. shade/spawns
+        # clip to fog_only, which this run computes from its own winner dict
+        # -- tiles the base already carries as real content but that no new
+        # screenshot re-witnesses are *not* in winner either, so the CLI's
+        # ordinary shade default would paint a checkerboard tint straight
+        # over that content. Measured: on tests/goon_test2, updating a base
+        # built from imp.jpg with q.jpg alone painted shade over 100+ tiles
+        # of imp's own already-explored territory. An explicit --overlays
+        # still overrides this, on the same "it's on the caller" basis
+        # already accepted for a base's own baked-in decorations.
+        args.overlays = "none" if args.base else OVERLAY_DEFAULT
 
     # Validated here rather than where it is used, so a typo fails immediately
     # instead of after the ~20s of work that produced the composite.
@@ -3949,6 +4015,18 @@ def main():
                     # empty badges_<name>.png to show the detector did not
                     # misfire. badge_found is the answer to that question.
                     badge_found.add(name)
+
+        # The previous composite, on an update run. Loaded here (independent
+        # of names/shots) and never added to either -- the menu prefilter,
+        # --max-shots, detect_map_size, and the whole of anchor_all below are
+        # all meant to see only the new screenshots. It joins the merge once,
+        # much later, as the paste canvas's own starting pixels (see the
+        # "paste composite" phase) rather than as a competing shot -- it
+        # needs no anchoring, since a finished composite's geometry is
+        # already exactly known (base_output_size, above).
+        base_bgr = cv2.imread(args.base) if args.base else None
+        if args.base and base_bgr is None:
+            raise SystemExit("cannot read --base image -- it appears invalid")
 
     # A score screen is a menu drawn over a dimmed copy of the map, and it
     # anchors well enough to poison a merge (see board_angle_fraction). Dropped
@@ -3992,12 +4070,33 @@ def main():
                          f"with fewer.")
 
     # Only when the caller omitted it: an explicit --map-size is always obeyed,
-    # so this can never override a size someone actually meant.
-    size_was_detected = args.map_size is None
+    # so this can never override a size someone actually meant. A --base image
+    # answers this on its own terms (its pixel dimensions name the board
+    # exactly -- base_output_size), so it takes priority over measuring the
+    # new screenshots, which on an update are typically a zoomed-in partial
+    # view that cannot measure the board at all.
+    #
+    # A base-derived size still counts as *stated*, not detected: it says
+    # nothing about whether fog exists, only which board this is, so a run
+    # that then locks no fog against it should warn rather than refuse (see
+    # --min-fog-lock below) -- exactly the replay/late-game case this feature
+    # is for.
+    size_was_detected = args.map_size is None and not args.base
     # One cache for the whole run, so whatever the size pre-pass measures below
     # is available to the anchor rather than measured again. See ShotCache.
     shot_cache = ShotCache()
-    if size_was_detected:
+    if args.map_size is None and args.base:
+        args.map_size = base_output_size(base_bgr.shape[:2], args.dark_thresh,
+                                         args.erode_px)
+        if args.map_size is None:
+            raise SystemExit(
+                f"--base doesn't match the pixel size of any board this "
+                f"program renders ({size_list()}). It has to be this "
+                f"program's own, unmodified merge output.")
+        print(f"base map size: {args.map_size}x{args.map_size} (base image "
+              f"is {base_bgr.shape[1]}x{base_bgr.shape[0]}px, exactly that "
+              f"size's own composite dimensions)")
+    elif size_was_detected:
         # detect_map_size takes plain per-shot dicts rather than Shot objects,
         # since shoreline/polyshore.py calls it directly too -- this adapts
         # main's shots without spending that boundary on this refactor.
@@ -4034,6 +4133,28 @@ def main():
     t_edge_off, _t_edge_sup = tgeom["edges"]
     tile_px = float(np.linalg.norm(u_col))
     print(f"tile step: {tile_px:.2f}px")
+
+    # Validated here, unconditionally, whenever --base is given -- whether
+    # args.map_size just came from the base above or was stated explicitly
+    # alongside it (which must still agree with the base's actual pixels
+    # rather than being taken on faith). base_rect is the exact rectangle
+    # this run's own composite would be cropped to at args.map_size, so this
+    # is the same check base_output_size makes, just against a size that is
+    # now fixed rather than searched.
+    base_rect = None
+    if args.base:
+        Wt, Ht = template.shape[1], template.shape[0]
+        x0c, y0c, x1c, y1c = output_crop(origin, u_col, u_row, args.map_size,
+                                         Wt, Ht)
+        want = (x1c - x0c, y1c - y0c)
+        got = (base_bgr.shape[1], base_bgr.shape[0])
+        if got != want:
+            raise SystemExit(
+                f"--base is {got[0]}x{got[1]}px, but a "
+                f"{args.map_size}x{args.map_size} board's own composite is "
+                f"{want[0]}x{want[1]}px. It has to be an unmodified merge "
+                f"output at this size.")
+        base_rect = (x0c, y0c, x1c, y1c)
 
     def sky_rebuild_for(n):
         """Rebuild one shot's masks with the sunrise-sky test.
@@ -4901,6 +5022,17 @@ def main():
 
     with PHASES("paste composite"):
         out = template.copy()
+        # --base's whole contribution: seed the canvas with its pixels before
+        # the paste loop runs, completely unmodified below. priority[key] and
+        # winner[key] are only ever set together (winner selection, and the
+        # bar/vision-promotion pass which only ever reorders an existing
+        # entry), so the paste loop only ever writes tiles someone explored
+        # this run -- every other tile is left exactly as the canvas was
+        # seeded. New content therefore always wins wherever a new screenshot
+        # shows any, with no ranking or demotion rule needed for the base.
+        if args.base:
+            bx0, by0, bx1, by1 = base_rect
+            out[by0:by1, bx0:bx1] = base_bgr
         for (i, j), (order, raw) in priority.items():
             r = tile_mask_bbox(origin, u_col, u_row, i, j, W, Hc)
             if r is None:
@@ -4994,19 +5126,20 @@ def main():
             cv2.polylines(out, [np.round(poly).astype(np.int32)], True,
                           RUIN_MARK_BGR, thick, cv2.LINE_AA)
 
-    full = np.float32([origin, origin + N * u_col,
-                       origin + N * u_col + N * u_row, origin + N * u_row])
-    x0c, y0c = np.floor(full.min(0)).astype(int)
-    x1c, y1c = np.ceil(full.max(0)).astype(int)
-    pad = 10
-    x0c, y0c = max(x0c - pad, 0), max(y0c - pad, 0)
-    x1c, y1c = min(x1c + pad, W), min(y1c + pad, Hc)
+    # Same rectangle --base is placed at and validated against above -- one
+    # implementation, so the two can never drift apart.
+    x0c, y0c, x1c, y1c = output_crop(origin, u_col, u_row, N, W, Hc)
     with PHASES("encode + write output"):
         cv2.imwrite(args.out, out[y0c:y1c, x0c:x1c])
 
     total = N * N
     print(f"\nmap: {N}x{N} = {total} tiles")
     print(f"explored (union): {len(winner)}/{total} ({100 * len(winner) / total:.1f}%)")
+    if args.base:
+        carried = total - len(winner)
+        print(f"BASE {carried}/{total}: tile(s) carried over unchanged from "
+              f"the base image -- the union above counts only this run's "
+              f"own screenshot(s)")
     if badge_fallback:
         print(f"  of which {len(badge_fallback)} tile(s) had no clean witness and fell "
               f"back to a badge-covered source: {sorted(badge_fallback)}")
