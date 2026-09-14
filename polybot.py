@@ -6,33 +6,46 @@ Screenshots can reach a merge two ways:
 
 or, when players just post their shots individually into a thread as they
 take them (likely interleaved with unrelated chatter/images), react to each
-one with MARK_EMOJI to opt it in, then run `!merge 20` (or `/merge`) with no
-attachments. The bot scans the channel/thread history for MARK_EMOJI'd images
-and, after a successful merge, reacts DONE_EMOJI on each source message so a
-later merge in the same thread doesn't pick them up again. The reactions *are*
-the state -- the bot itself remembers nothing between commands, matching the
-same-message path below.
+one with MARK_EMOJI to opt it in, then run `!merge 20` with no attachments.
+The bot scans the channel/thread history for MARK_EMOJI'd images and, after a
+successful merge, reacts DONE_EMOJI on each source message so a later merge in
+the same thread doesn't pick them up again. The reactions *are* the state --
+the bot itself remembers nothing between commands, matching the same-message
+path below.
 
-There are two front ends, and they differ only in how the options arrive:
-`!merge [size] [layers...]` parses free text, while `/merge` takes the same
-two as typed options that Discord validates and describes at the point of
-typing. Both call do_merge, so there is one queue, one estimate and one set of
-channel copy however a merge was asked for.
+There are two front ends, and they now differ in more than how the options
+arrive. `!merge [size] [layers...]` parses free text and is the *only* way to
+reach the MARK_EMOJI reaction scan. `/merge` takes screenshots as direct
+attachments (`new`/`new2`/`new3`), optionally updating a prior composite
+(`base`) instead of starting fresh, with `size` and `layers` as typed options
+Discord validates and describes at the point of typing. Both call do_merge, so
+there is one queue, one estimate and one set of channel copy however a merge
+was asked for.
 
-`/merge` deliberately takes **no attachments**. A slash command has no
-variadic attachment option, so offering that path would mean MAX_SHOTS
-separate slots in the picker and one file dialog each; `!merge` keeps the job,
-where dropping four files onto one message already works well. Since the
-reaction workflow is the one most players use, this costs the common case
-nothing.
+`/merge` deliberately does **not** offer the reaction workflow. A slash
+command has no variadic attachment option, so it takes three named shot slots
+(`new`/`new2`/`new3`) rather than `!merge`'s drag-and-drop of up to MAX_SHOTS
+files; a player with more shots than that, or shots scattered across many
+messages in a thread, is better served by `!merge`. And the
+reaction scan needs message_content and Read Message History regardless of
+front end (see below), so building it into a slash command buys no permission
+benefit over `!merge`, only a second, more limited way to reach the same code
+path. Keeping it prefix-only is what makes a slash-only deployment possible at
+all: a guild that never grants the privileged intent can still run `/merge`
+in full.
 
 Two things slash commands do not change, recorded because both look like they
 should. Guild operators still grant the same REQUIRED_PERMS in the same
 channels -- the composite is an ordinary channel message either way; what
-changes is that a missing permission becomes *sayable*, since an interaction
-reaches the bot whatever the channel overwrites say. And the message_content
-privileged intent is still required, because the MARK_EMOJI scan reads
-attachments off other people's messages.
+changes is that a missing permission becomes *sayable* on `/merge`, since an
+interaction reaches the bot whatever the channel overwrites say -- one thing
+the reaction workflow, being prefix-only now, cannot benefit from: a channel
+that silently loses view_channel leaves a `!merge` reaction-scan player with
+no diagnosable failure at all, same as before this split. And the
+message_content privileged intent is still required for `!merge`'s own
+MARK_EMOJI scan, which reads attachments off other people's messages --
+shedding it is the usual reason to migrate to slash commands, and it is
+exactly what moving the scan off `/merge` finally lets a deployment do.
 
 The bot downloads the resolved images to a scratch directory, shells out to
 polymerge.py, and posts merged.png back.
@@ -645,9 +658,9 @@ def base_size(stdout):
     """The board size polymerge read off --base's own pixel dimensions.
 
     A third possible source of the size alongside a player-stated one and a
-    detected one -- on a /merge-update run the size came from neither, so
-    without this `used_size` renders "NonexNone" in the console log and the
-    size-warning captions. Distinct from detected_size's own regex: that
+    detected one -- updating a base with no size stated gets it from neither,
+    so without this `used_size` renders "NonexNone" in the console log and
+    the size-warning captions. Distinct from detected_size's own regex: that
     phrase means a specific thing (span/fog-period measurement across
     screenshots) which is not what happened here."""
     return _first_match_int(stdout, r"base map size: (\d+)x\d+")
@@ -705,7 +718,7 @@ async def run_polymerge(workdir, image_paths, map_size, out_path, overlays=None,
     measured. It refuses rather than guessing when the shots cannot answer, so
     None can never become a silently wrong size.
 
-    `base` is a prior composite's path, used only by /merge-update. When set,
+    `base` is a prior composite's path, used only by /merge. When set,
     polymerge places it as the paste canvas's own starting pixels and reads
     the board size off its exact pixel dimensions if `map_size` was not also
     given -- so `map_size=None, base=<path>` is a normal and common
@@ -987,22 +1000,12 @@ class Caller:
 
     @classmethod
     def from_interaction(cls, interaction, attachments=()):
-        # Empty for /merge, which is reactions-only: a slash command has no
-        # variadic attachment option, so parity with !merge's drag-and-drop
-        # would mean MAX_SHOTS separate option slots and one file picker each.
-        # /merge-update passes its own fixed, small set of shot attachments
-        # instead, which costs exactly that many named slots.
+        # /merge passes its own fixed, small set of shot attachments (new,
+        # new2, new3) -- a slash command has no variadic attachment option, so
+        # parity with !merge's drag-and-drop of up to MAX_SHOTS files would
+        # mean that many named option slots, which is not worth the clutter.
         return cls(interaction.channel, interaction.guild, interaction.user,
                    list(attachments), interaction=interaction)
-
-    @property
-    def can_attach(self):
-        """Whether this entry point can carry screenshots on the command itself.
-
-        True for a prefix command, false for a slash one. Player-facing copy
-        keys on this rather than assuming: telling a /merge user to attach
-        their shots to the command sends them somewhere they cannot go."""
-        return self._ctx is not None
 
     def typing(self):
         return self.channel.typing()
@@ -1224,9 +1227,9 @@ def help_text():
 
     It is deliberately the *whole* help rather than a pointer to a further
     command: someone who has gone looking for help should not have to ask
-    twice. That costs length -- ~1450 characters against Discord's 2000, so
-    there is room for a few more bullets and no more. Check len() before
-    adding one; the failure is the whole message vanishing, not a truncation.
+    twice. That costs length -- ~1720 characters against Discord's 2000, so
+    there is little room for more. Check len() before adding a bullet; the
+    failure is the whole message vanishing, not a truncation.
 
     The layer list is built from OVERLAY_HELP rather than written out, for the
     same anti-drift reason as everything else here: a layer the parser accepts
@@ -1235,13 +1238,16 @@ def help_text():
 
     `!merge` on its own does *not* print this -- it attempts a merge, since
     that is what someone who has already attached their shots wants, and the
-    size is measurable without them saying it. The three replies a lost player
-    actually reaches -- an unrecognized layer word, an unrecognized size, and no
-    screenshots found -- all name a route to this text, so it stays one message
-    away from anywhere someone gets stuck. Which route they name differs on
-    purpose: only the last can be reached from `/merge`, so it names the slash
-    help too, and a guild that never authorized slash commands still has one
-    that works.
+    size is measurable without them saying it. The replies a lost player
+    actually reaches -- an unrecognized layer word on either front end, and
+    `!merge`'s own unrecognized size and no-screenshots-found -- all name a
+    route to this text, so it stays one message away from anywhere someone
+    gets stuck; the unrecognized-size reply is unreachable from `/merge`,
+    whose sizes are typed choices Discord validates before the command ever
+    runs. `/merge`'s own no-attachments reply is the exception: since `/merge`
+    takes no reactions, the fix a lost `/merge` user needs is `!merge` itself
+    rather than more explanation, so that reply names the prefix command
+    instead of the help.
 
     Symbols the composite can contain are explained here *and*, where they are
     conditional, at the point of use -- the success caption names the ruin
@@ -1266,19 +1272,24 @@ def help_text():
             f"measured from the screenshots.\n"
             + "".join(f"- `{n}` shows {OVERLAY_HELP[n]}.\n" for n in OVERLAY_NAMES))
     return (
-        f"Usage: `/merge`, or `{COMMAND_PREFIX}merge`. React {MARK_EMOJI} on "
-        f"screenshots posted above, then run either one. `{COMMAND_PREFIX}merge` "
-        f"also takes screenshots attached to its own message, which `/merge` "
-        f"cannot.\n"
+        f"Usage: `{COMMAND_PREFIX}merge`, with screenshots attached to that "
+        f"message, or react {MARK_EMOJI} on screenshots posted above and run "
+        f"`{COMMAND_PREFIX}merge` with none attached. `/merge` attaches "
+        f"screenshots directly to the command instead (`new`/`new2`/`new3`) "
+        f"and does not use the {MARK_EMOJI} reaction workflow -- attach a map "
+        f"this bot posted earlier as its `base` to update that map instead of "
+        f"starting fresh, with or without new screenshots alongside it.\n"
         f"`/merge` offers the options below as fields. With "
         f"`{COMMAND_PREFIX}merge` they are words after the command, in any "
         f"order, e.g. `{COMMAND_PREFIX}merge grid 20`:\n"
         + opts +
         f"\n"
         f"Other information:\n"
-        f"- Works on up to {MAX_SHOTS} shots. Supported formats: {fmts}.\n"
-        f"- After the merge runs, the bot reacts {DONE_EMOJI} on the screenshots "
-        f"merged, so they won't be merged again.\n"
+        f"- Works on up to {MAX_SHOTS} shots ({COMMAND_PREFIX}merge) or 3 "
+        f"(/merge). Supported formats: {fmts}.\n"
+        f"- After a {COMMAND_PREFIX}merge from reactions, the bot reacts "
+        f"{DONE_EMOJI} on the screenshots merged, so they won't be merged "
+        f"again.\n"
         f"- Each screenshot needs two adjoining sides of the board in frame.\n"
         f"- Assumes the top and bottom 15% of screenshots contain UI elements "
         f"and crops them.\n"
@@ -1289,9 +1300,6 @@ def help_text():
         f"- The merge takes the highest-resolution shot, except it "
         f"deprioritizes tiles with village/ruin capture badges and "
         f"prioritizes tiles with city population bars.\n"
-        f"- `/merge-update` merges screenshots you attach directly; attach a "
-        f"map this bot posted earlier as its `base` to update it instead of "
-        f"starting fresh.\n"
         f"\n"
         f"Credits: Made by palanq, with support from our robot overlords and "
         f"the ArcticWolves team. {CREDIT_EMOJI}"
@@ -1321,9 +1329,12 @@ async def merge(ctx, size: str = None, *extras):
     to that same message, or with no attachments to merge every screenshot in
     this channel/thread that's been reacted MARK_EMOJI and not yet merged.
 
-    This is the free-text front end. /merge below does the same job with typed
-    options, and both hand off to do_merge -- so there is one queue, one
-    estimate and one set of channel copy, whichever way a merge was asked for."""
+    This is the only front end that reads MARK_EMOJI reactions -- /merge below
+    takes screenshots as direct attachments instead, and can update a prior
+    composite (`base`), but does not scan history (see the module docstring
+    for why that split exists). Both hand off to do_merge, though, so there is
+    one queue, one estimate and one set of channel copy whichever way a merge
+    was asked for."""
     caller = Caller.from_ctx(ctx)
     log_invocation(caller, f"{COMMAND_PREFIX}merge {size} {' '.join(extras)}")
     if size is not None and size.lower() in ("help", "?"):
@@ -1383,87 +1394,72 @@ async def merge(ctx, size: str = None, *extras):
     # is typing `/merge` -- which is where a player who needs the instructions
     # actually is. That is most of the discoverability the help command gives
     # up by not being called `merge-something`, bought back for nothing.
-    description="Merge screenshots reacted " + MARK_EMOJI
-                + f" into one map -- /{HELP_COMMAND} explains",
+    description="Merge screenshots into one map, or update one this bot "
+                f"posted -- /{HELP_COMMAND} explains",
 )
 @app_commands.choices(size=[
     app_commands.Choice(name=f"{n}x{n} ({MAP_SIZE_NAMES[n]})", value=n)
     for n in MAP_SIZES
 ])
 @app_commands.describe(
-    size="Board size. Leave blank to measure it from the screenshots.",
-    **{n: OVERLAY_HELP[n].capitalize() for n in OVERLAY_NAMES},
-)
-async def merge_slash(interaction: discord.Interaction,
-                      size: typing.Optional[app_commands.Choice[int]] = None,
-                      shade: bool = False, grid: bool = False,
-                      spawns: bool = False, push: bool = False):
-    """/merge -- the reaction workflow, with the options typed rather than parsed.
-
-    Deliberately takes no attachments. A slash command has no variadic
-    attachment option, so offering the drag-and-drop path here would mean
-    MAX_SHOTS separate slots cluttering the picker and one file dialog each;
-    `!merge` keeps that job, where dropping four files on one message just
-    works.
-
-    The choices and descriptions above are built from MAP_SIZES,
-    MAP_SIZE_NAMES and OVERLAY_HELP for the same anti-drift reason help_text
-    is: a layer the parser accepts but the UI does not name is a feature nobody
-    can find, and one the UI names but the parser rejects is an error the
-    player did not earn."""
-    # First statement, before the history scan below: an interaction has three
-    # seconds to be answered at all, and collect_marked_shots walks up to
-    # HISTORY_LIMIT messages at 100 per API call before anything is sent.
-    # Ephemeral because it is a placeholder rather than a message -- the real
-    # ack goes to the channel, where everyone waiting on the merge can see it.
-    await interaction.response.defer(ephemeral=True)
-    caller = Caller.from_interaction(interaction)
-    layers = {n for n, on in (("shade", shade), ("grid", grid),
-                              ("spawns", spawns), ("push", push)) if on}
-    log_invocation(caller, f"/merge {size.value if size else None} "
-                           f"{' '.join(sorted(layers))}")
-    await do_merge(caller, size.value if size else None, layers)
-
-
-@bot.tree.command(
-    name="merge-update",
-    description="Merge screenshots directly, optionally updating a prior map",
-)
-@app_commands.choices(size=[
-    app_commands.Choice(name=f"{n}x{n} ({MAP_SIZE_NAMES[n]})", value=n)
-    for n in MAP_SIZES
-])
-@app_commands.describe(
-    new="A new screenshot to merge or fold in.",
+    new="A new screenshot to merge or fold in. Optional with `base`, to just "
+        "redraw its layers.",
     base="A prior map this bot posted, to update instead of starting fresh.",
     size="Board size. Leave blank to measure it (or read it off `base`).",
+    layers="Layers to draw, space-separated ("
+           + ", ".join(OVERLAY_NAMES) + f") -- /{HELP_COMMAND} explains each",
     new2="A second new screenshot, if you have one.",
     new3="A third new screenshot, if you have one.",
 )
-async def merge_update_slash(interaction: discord.Interaction,
-                             new: discord.Attachment,
-                             base: typing.Optional[discord.Attachment] = None,
-                             size: typing.Optional[app_commands.Choice[int]] = None,
-                             new2: typing.Optional[discord.Attachment] = None,
-                             new3: typing.Optional[discord.Attachment] = None):
-    """A standalone command, deliberately not folded into /merge as a
-    subcommand of it: Discord gives a command options or subcommands, never
-    both, so adding this under /merge would have meant turning the existing,
-    working reaction workflow into /merge something-else to make room. This
-    costs a picker collision instead -- typing /merge lists this command too,
-    since Discord matches by substring the same way it does for
-    /polymerge-help -- accepted for now rather than reworked.
+async def merge_slash(interaction: discord.Interaction,
+                      new: typing.Optional[discord.Attachment] = None,
+                      base: typing.Optional[discord.Attachment] = None,
+                      size: typing.Optional[app_commands.Choice[int]] = None,
+                      layers: typing.Optional[str] = None,
+                      new2: typing.Optional[discord.Attachment] = None,
+                      new3: typing.Optional[discord.Attachment] = None):
+    """/merge -- direct-attach only, deliberately not the MARK_EMOJI reaction
+    workflow. That workflow needs message_content and Read Message History
+    regardless of which front end reaches it (collect_marked_shots reads
+    attachments off arbitrary history messages), so building it into a slash
+    command buys no permission benefit over `!merge` -- only a second,
+    narrower way to run the same scan. `!merge` alone owns it, which is what
+    lets a slash-only deployment skip that privileged intent entirely; a
+    player with shots scattered across a thread, or more than three of them,
+    is pointed at `!merge` instead (see the no-attachments reply below and
+    help_text).
 
-    Takes its shots as direct attachments rather than through the MARK_EMOJI
-    reaction workflow, which is what makes `base` possible in the first
-    place: a previous merge's own output is not a screenshot anyone would
-    react to. Omitting `base` makes this an ordinary direct-attach merge --
-    the same job /merge already does, reached a different way -- and `size`
-    behaves exactly as it does there (blank measures it). Supplying `base`
-    updates that composite instead of starting from blank fog, and `size` is
-    then normally left blank too, since the base's own pixel dimensions name
-    the board exactly (see polymerge's base_output_size)."""
+    `new`/`new2`/`new3` are three named slots rather than one variadic
+    attachment option, because Discord has no such option type -- each
+    ATTACHMENT-typed parameter is exactly one file. Three is chosen over
+    matching `!merge`'s MAX_SHOTS-file drag-and-drop as a picker-clutter
+    tradeoff: a player with more shots, or shots posted over time, is already
+    better served by `!merge`.
+
+    `base` updates a prior composite this bot posted instead of starting from
+    blank fog, and `new` is optional precisely so `base` alone is a complete
+    request: redraw that composite's overlays (e.g. someone forgot `grid` the
+    first time) without resupplying any screenshot. polymerge's own --base
+    learned the same trick -- it can run with no images at all, classifying
+    the base's pixels directly to know which tiles are still fog for `layers`
+    that need that (shade/spawns) -- so nothing here has to fake up a
+    screenshot to ask for it. `size` behaves exactly as it always did (blank
+    measures it), except that with `base` and no explicit `size` the board
+    comes off the base's own pixel dimensions instead (see polymerge's
+    base_output_size).
+
+    `layers` is one free-text field rather than a bool per layer, parsed by
+    the same parse_overlays that reads !merge's trailing words -- so it takes
+    the same words, aliases and `plain`, and a typo gets the same reply
+    !merge gives rather than a second copy of that logic."""
     shots = [a for a in (new, new2, new3) if a is not None]
+    if not shots and base is None:
+        await interaction.response.send_message(
+            f"Attach a screenshot, or a map I posted earlier to update. "
+            f"{SAD_EMOJI} To merge screenshots people reacted {MARK_EMOJI} "
+            f"above, use `{COMMAND_PREFIX}merge` instead.",
+            ephemeral=True)
+        return
     bad = [a.filename for a in shots + ([base] if base else [])
            if pathlib.Path(a.filename).suffix.lower() not in IMAGE_EXTS]
     if bad:
@@ -1471,13 +1467,32 @@ async def merge_update_slash(interaction: discord.Interaction,
             f"That doesn't look like a supported image: {', '.join(bad)}. "
             f"{SAD_EMOJI}", ephemeral=True)
         return
-    # Same three-second reasoning as /merge: defer before anything slower.
+    overlay_set, bad_layers = parse_overlays([] if layers is None else layers.split())
+    if bad_layers:
+        # Validated before defer -- there is nothing slow about parsing this
+        # string, so there is no need to spend the interaction token on it.
+        await interaction.response.send_message(
+            f"Don't know what to do with {', '.join(f'`{w}`' for w in bad_layers)}. "
+            f"{SAD_EMOJI} You can add "
+            + ", ".join(f"`{n}`" for n in OVERLAY_NAMES)
+            + f", in any order. `/{HELP_COMMAND}` explains what each one draws.",
+            ephemeral=True)
+        return
+    # First statement after validation: an interaction has three seconds to be
+    # answered at all. Ephemeral because it is a placeholder rather than a
+    # message -- the real ack goes to the channel, where everyone waiting on
+    # the merge can see it.
     await interaction.response.defer(ephemeral=True)
     caller = Caller.from_interaction(interaction, attachments=shots)
-    log_invocation(caller, f"/merge-update {size.value if size else None} "
-                           f"base={base is not None}")
-    await do_merge(caller, size.value if size else None, OVERLAY_DEFAULT,
-                   base=base)
+    log_invocation(caller, f"/merge {size.value if size else None} "
+                           f"base={base is not None} "
+                           f"{' '.join(sorted(overlay_set))}")
+    # allow_history=False: an empty `shots` here means "just base", never
+    # "go scan the channel for reacted screenshots" -- see do_merge. Reaching
+    # this call with both shots and base empty is impossible, since the check
+    # above already refused that case before defer.
+    await do_merge(caller, size.value if size else None, overlay_set,
+                   base=base, allow_history=False)
 
 
 @bot.tree.command(name=HELP_COMMAND,
@@ -1496,24 +1511,32 @@ async def merge_help_slash(interaction: discord.Interaction):
     await interaction.response.send_message(help_text(), ephemeral=True)
 
 
-async def do_merge(caller, map_size, overlays, base=None):
+async def do_merge(caller, map_size, overlays, base=None, allow_history=True):
     """Run one merge and report it, however the merge was asked for.
 
     Shared by every front end, which is what puts them on one queue:
     MERGE_LOCK, _waiting, _running_* and merge_speed are module state reached
-    only through here, so a /merge-update queues behind a !merge and
-    wait_estimate covers all of them. Do not give any front end its own path
-    to the semaphore.
+    only through here, so a /merge queues behind a !merge and wait_estimate
+    covers both of them. Do not give any front end its own path to the
+    semaphore.
 
-    `base` is /merge-update's optional prior-composite attachment. It changes
-    three things and nothing else: it is downloaded alongside the shots and
-    passed to polymerge as --base; the board size may come from it instead of
-    from map_size/detection (see used_size below); and the ack/caption wording
-    says "updating" rather than "merging". /merge-update always supplies its
-    own attachments (`new`/`new2`/`new3`), so `caller.attachments` is already
-    non-empty here regardless of `base` -- the reaction-history scan below is
-    unreachable from that command, the same way it already is for `!merge`
-    with files attached."""
+    `base` is /merge's optional prior-composite attachment. It changes three
+    things and nothing else: it is downloaded alongside the shots and passed
+    to polymerge as --base; the board size may come from it instead of from
+    map_size/detection (see used_size below); and the ack/caption wording
+    says "updating" rather than "merging".
+
+    `allow_history` is False only for /merge. That command's shots
+    (`new`/`new2`/`new3`) are all optional, since a base image on its own is
+    enough to ask for -- redraw this composite's overlays, no new screenshot
+    needed (see base_only below). So `caller.attachments` can legitimately be
+    empty there, and it must not fall through to the reaction-history scan
+    below, which is `!merge`'s job alone (see the module docstring) and would
+    either misfire on whatever is marked in the channel or, with nothing
+    marked, report a confusing "no usable screenshots found" for a command
+    that never wanted any. merge_slash validates that at least one of its own
+    shots or `base` was given, so allow_history=False with an empty
+    caller.attachments always means base_only here."""
     global _running_shots, _running_since
 
     # Both of these are install faults, so the channel gets the consequence in
@@ -1545,7 +1568,11 @@ async def do_merge(caller, map_size, overlays, base=None):
     source_messages = []
     barren = 0
     from_history = False
-    if not shots:
+    # See do_merge's docstring: /merge passes allow_history=False, and an
+    # empty caller.attachments there means "just redraw base's overlays",
+    # never "go scan the channel for reacted screenshots".
+    base_only = not shots and not allow_history and base is not None
+    if not shots and allow_history:
         from_history = True
         try:
             pairs, barren = await collect_marked_shots(caller.channel)
@@ -1563,23 +1590,22 @@ async def do_merge(caller, map_size, overlays, base=None):
         shots = [a for _, a in pairs]
         source_messages = list({m.id: m for m, _ in pairs}.values())
 
-    if not shots:
+    if not shots and not base_only:
+        # This branch is only reachable via !merge's own history scan coming
+        # up empty -- allow_history is False on every other caller, and
+        # /merge's own validation already refuses before do_merge is ever
+        # called when it would otherwise land here with an empty shots and no
+        # base (see merge_slash). So the caller is always a prefix command
+        # that can attach directly, and the reply says so unconditionally.
+        #
         # The one reply a lost player is most likely to see, so it is where the
         # help gets named -- a bare `!merge` no longer prints it, and someone
-        # who ran a merge with nothing marked is exactly who was looking for it.
-        #
-        # Both routes to the help are named, because which one is reachable
-        # depends on how they got here: the slash help needs the guild to have
-        # authorized slash commands at all, and `!merge help` always works.
-        # Attaching is named only when it is possible -- /merge takes no
-        # attachments, so telling a slash user to attach them sends them to a
-        # dead end.
-        attach = ("Attach them to this message, or react" if caller.can_attach
-                  else "React")
-        msg = (f"No usable screenshots found. {SAD_EMOJI} {attach} "
-               f"{MARK_EMOJI} on screenshots posted above, then merge again. "
-               f"`/{HELP_COMMAND}` or `{COMMAND_PREFIX}merge help` explains "
-               f"how.")
+        # who ran a merge with nothing marked is exactly who was looking for
+        # it.
+        msg = (f"No usable screenshots found. {SAD_EMOJI} Attach them to this "
+               f"message, or react {MARK_EMOJI} on screenshots posted above, "
+               f"then merge again. `/{HELP_COMMAND}` or "
+               f"`{COMMAND_PREFIX}merge help` explains how.")
         if barren:
             message, it = ("message", "it") if barren == 1 else ("messages", "them")
             msg += f" ({barren} marked {message} had no image on {it}.)"
@@ -1656,9 +1682,16 @@ async def do_merge(caller, map_size, overlays, base=None):
     # replacing the seed, which is exactly when a queued player is watching
     # this message.
     def starting_text():
-        what = (f"Updating the map with {len(shots)} new screenshot{plural}"
-                if base is not None
-                else f"Merging {len(shots)} screenshot{plural}{at}")
+        if not shots:
+            # Only reachable via /merge with a base and no new screenshots
+            # at all -- see base_only below. There is nothing to
+            # merge, so say what is actually happening: redrawing the prior
+            # composite's overlays.
+            what = "Redrawing the map's layers"
+        elif base is not None:
+            what = f"Updating the map with {len(shots)} new screenshot{plural}"
+        else:
+            what = f"Merging {len(shots)} screenshot{plural}{at}"
         return (f"{what}{note} -- "
                 f"{human_wait(merge_estimate(len(shots)))}. {WAIT_EMOJI}")
 
@@ -1853,6 +1886,9 @@ async def do_merge(caller, map_size, overlays, base=None):
                        f"Merged the other {used} in {elapsed:.0f}s. A "
                        f"screenshot needs two adjoining sides of the board "
                        f"in frame.")
+        elif base is not None and not shots:
+            caption = (f"Redrew the map's layers in {elapsed:.0f}s. "
+                       f"{HAPPY_EMOJI}")
         elif base is not None:
             caption = (f"Updated the map with {len(shots)} new "
                        f"screenshot{plural} in {elapsed:.0f}s. {HAPPY_EMOJI}")

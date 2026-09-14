@@ -3827,7 +3827,10 @@ FOG_LOCK_NCC = 0.7
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("images", nargs="+")
+    ap.add_argument("images", nargs="*",
+                    help="screenshots to merge. May be omitted entirely when "
+                         "--base is given and only its overlays are wanted -- "
+                         "see --base.")
     ap.add_argument("-o", "--out", default="merged.png")
     ap.add_argument("--ui-mask", help="JSON of per-file exclusion rectangles, "
                     "for anything --top-crop/--bottom-crop don't cover (a "
@@ -3891,7 +3894,8 @@ def main():
                     "be this program's own, unmodified output -- its pixel "
                     "dimensions name the board size exactly (see "
                     "base_output_size), and a resized or re-encoded copy is "
-                    "refused rather than guessed at.")
+                    "refused rather than guessed at. images may be omitted "
+                    "entirely with --base, to redraw its --overlays alone.")
     ap.add_argument("--fog-ncc", type=float, default=0.4,
                     help="a tile counts as fog when it correlates at least this "
                          "well with the template's fog art. Measured on a real "
@@ -3968,17 +3972,27 @@ def main():
     ap.add_argument("--debug-dir")
     args = ap.parse_args()
 
+    if not args.images and not args.base:
+        ap.error("no screenshots given, and no --base to update either -- "
+                 "nothing to merge")
+
     if args.overlays is None:
-        # --base's own default is "none", not OVERLAY_DEFAULT. shade/spawns
-        # clip to fog_only, which this run computes from its own winner dict
-        # -- tiles the base already carries as real content but that no new
-        # screenshot re-witnesses are *not* in winner either, so the CLI's
-        # ordinary shade default would paint a checkerboard tint straight
-        # over that content. Measured: on tests/goon_test2, updating a base
-        # built from imp.jpg with q.jpg alone painted shade over 100+ tiles
-        # of imp's own already-explored territory. An explicit --overlays
-        # still overrides this, on the same "it's on the caller" basis
-        # already accepted for a base's own baked-in decorations.
+        # --base's own default is "none", not OVERLAY_DEFAULT ("shade"),
+        # simply so an update run stays a quiet continuation of the prior
+        # merge unless asked otherwise -- not, any more, to dodge a
+        # correctness bug. shade/spawns clip to fog_only, which used to come
+        # only from this run's own winner dict: a tile the base already
+        # carries as real content but that no new screenshot re-witnesses was
+        # not in winner either, so requesting shade explicitly painted a
+        # checkerboard tint straight over that content (measured on
+        # tests/goon_test2: 100+ tiles of imp.jpg's own already-explored
+        # territory). fog_only now also classifies the base's own pixels
+        # directly (see the "base fog classification" phase below) whenever
+        # an overlay that needs it is requested and a base is given, with or
+        # without new screenshots, so that is fixed at the source. This
+        # default is kept anyway, on the same "it's on the caller" basis
+        # already accepted for a base's own baked-in decorations -- an
+        # explicit --overlays still overrides it.
         args.overlays = "none" if args.base else OVERLAY_DEFAULT
 
     # Validated here rather than where it is used, so a typo fails immediately
@@ -4048,7 +4062,12 @@ def main():
                       f"of its detail runs at a board angle (a score screen "
                       f"or other menu drawn over the map?)")
                 names.remove(name)
-    if not names:
+    if all_names and not names:
+        # Guarded on all_names, not just "not names": a --base-only run with
+        # no new screenshots at all starts with names already empty, and that
+        # is not a menu-screen refusal -- see the "no screenshots given" check
+        # near the top of main.
+        #
         # Cause and remedy on the one line, as every refusal here does: polybot
         # promotes only the first line to the channel. No mention of edge angles
         # -- a player cannot act on that, and infers the shape of it from the
@@ -4314,7 +4333,9 @@ def main():
     for n, M in prior_M_of.items():
         if M is not None:
             shots[n].prior = to_h(M)
-    if not M_of:
+    if all_names and not M_of:
+        # Guarded on all_names for the same reason as the menu-screen refusal
+        # above: a --base-only run legitimately has nothing to anchor.
         raise SystemExit(
             "no valid images found -- none of them could be placed on the "
             "board. They need to be in-game screenshots showing part of the "
@@ -4466,7 +4487,10 @@ def main():
           f"{FOG_LOCK_NCC}): "
           + "  ".join(f"{n}={fog_lock[n]}" for n in names))
     size_unverified = False
-    if args.min_fog_lock > 0 and max(fog_lock.values()) < args.min_fog_lock:
+    # Guarded on names: with none (a --base-only run adding no new
+    # screenshots), there is nothing here to check a fog lock on at all, and
+    # max() on the empty fog_lock dict would raise rather than mean anything.
+    if names and args.min_fog_lock > 0 and max(fog_lock.values()) < args.min_fog_lock:
         # Two things produce a run where nothing locks and they want opposite
         # answers: --map-size is wrong, or the board has no fog left at all (a
         # replay, or a finished game). Nothing available here separates them.
@@ -4651,7 +4675,12 @@ def main():
             for per in samples.values():
                 per.pop(n, None)
             del fog_lock[n]
-        if not names:
+        if all_names and not names:
+            # Guarded on all_names, same reason as the other refusals above:
+            # a --base-only run starts this block with names already empty,
+            # and that is not every shot having just been dropped as
+            # misanchored.
+            #
             # Same audience as the refusals above: "misanchored" names an
             # internal state, and the player needs the consequence and the
             # remedy instead. The per-shot lines just printed carry the cause
@@ -5052,16 +5081,49 @@ def main():
         # are drawn before the ruin markers below, which therefore stay the
         # topmost thing on the composite.
         #
-        # `winner` holds exactly the tiles somebody explored, so its complement
-        # is the fog still showing through from the template -- which is what
-        # the shading layer is clipped to. Built from the same tile_poly the
-        # paste loop uses, so the two agree tile for tile by construction.
+        # `winner` holds exactly the tiles somebody explored *this run*, so its
+        # complement is the fog still showing through from the template --
+        # which is what the shading layer is clipped to. Built from the same
+        # tile_poly the paste loop uses, so the two agree tile for tile by
+        # construction.
+        #
+        # On a --base run, `winner` alone is not the right complement, because
+        # a tile the base already carries as real content but that no new
+        # screenshot re-witnesses is not in `winner` either -- so without this,
+        # requesting shade/spawns painted a checkerboard tint straight over
+        # already-explored base content (measured on tests/goon_test2: 100+
+        # tiles of imp.jpg's own territory). base_explored closes that by
+        # classifying the base's own pixels directly with the same fog test
+        # every shot's tiles get, for whichever tiles `winner` left open --
+        # which, with no new screenshots at all, is every tile. No anchoring
+        # is needed: the base is already in the template's exact pixel frame
+        # (base_rect), so it is sampled in place like an already-warped shot.
+        base_explored = set()
+        if args.base and overlays & OVERLAY_FOG_ONLY:
+            with PHASES("base fog classification"):
+                base_canvas = np.zeros_like(template)
+                bx0, by0, bx1, by1 = base_rect
+                base_canvas[by0:by1, bx0:bx1] = base_bgr
+                base_valid = np.zeros((Hc, W), np.uint8)
+                base_valid[by0:by1, bx0:bx1] = 255
+                for i in range(N):
+                    for j in range(N):
+                        if (i, j) in winner:
+                            continue
+                        s = sample_tile(
+                            base_canvas, base_valid, tmpl_gray,
+                            tile_poly(origin, u_col, u_row, i, j, args.tile_inset),
+                            args.fog_ncc, args.min_valid_frac,
+                            wedge_poly=tile_top_wedge(origin, u_col, u_row, i, j),
+                            fog_wedge_ncc=args.fog_wedge_ncc)
+                        if s is not None and s["explored"]:
+                            base_explored.add((i, j))
         fog_only = None
         if overlays & OVERLAY_FOG_ONLY:
             fog_only = np.zeros((Hc, W), np.uint8)
             for i in range(N):
                 for j in range(N):
-                    if (i, j) in winner:
+                    if (i, j) in winner or (i, j) in base_explored:
                         continue
                     poly = tile_poly(origin, u_col, u_row, i, j, 0.0)
                     cv2.fillConvexPoly(fog_only,
