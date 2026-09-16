@@ -104,7 +104,7 @@ MAP_SIZE_NAMES = {11: "tiny", 14: "small", 16: "normal", 18: "large",
 # once, and the cost was not the shading but the second word every player then
 # had to learn in order to get back to plain output. An empty default costs the
 # player who wants shading one word and costs everyone else nothing.
-OVERLAY_NAMES = ("shade", "grid", "spawns", "push")
+OVERLAY_NAMES = ("shade", "grid", "spawns", "push", "vision")
 OVERLAY_DEFAULT = frozenset()
 # One line each, for `!merge help`. Keyed by layer so the help cannot list a
 # layer the parser does not accept, or miss one it does.
@@ -113,6 +113,8 @@ OVERLAY_HELP = {
     "grid": "tile grid lines on the full map",
     "spawns": "the default spawn zones on fog tiles (for most map types)",
     "push": "default push direction arrows on every tile",
+    "vision": "an outline around each identified player's own explored "
+              "area, one color per player (best-effort)",
 }
 # Typed by players, so accept the obvious synonyms rather than making them
 # guess the one word that works.
@@ -120,7 +122,9 @@ OVERLAY_ALIASES = {"shading": "shade", "shaded": "shade", "checker": "shade",
                    "checkerboard": "shade", "gridded": "grid", "lines": "grid",
                    "spawn": "spawns", "spawnzones": "spawns",
                    "zones": "spawns", "arrows": "push", "pushes": "push",
-                   "pushdirections": "push"}
+                   "pushdirections": "push", "outline": "vision",
+                   "outlines": "vision", "territory": "vision",
+                   "borders": "vision", "players": "vision"}
 # cv2.imread's formats, restricted to what phones and tablets actually produce.
 # The test sets alone cover three of them (jpg/png/webp), deliberately.
 #
