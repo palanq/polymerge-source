@@ -104,7 +104,7 @@ MAP_SIZE_NAMES = {11: "tiny", 14: "small", 16: "normal", 18: "large",
 # once, and the cost was not the shading but the second word every player then
 # had to learn in order to get back to plain output. An empty default costs the
 # player who wants shading one word and costs everyone else nothing.
-OVERLAY_NAMES = ("shade", "grid", "spawns", "push", "vision")
+OVERLAY_NAMES = ("shade", "grid", "spawns", "push", "vision", "vision-each")
 OVERLAY_DEFAULT = frozenset()
 # One line each, for `!merge help`. Keyed by layer so the help cannot list a
 # layer the parser does not accept, or miss one it does.
@@ -115,6 +115,8 @@ OVERLAY_HELP = {
     "push": "default push direction arrows on every tile",
     "vision": "an outline around each identified player's own explored "
               "area, one color per player (best-effort)",
+    "vision-each": "an extra image per player, white-washing what they "
+                   "haven't personally explored yet (best-effort)",
 }
 # Typed by players, so accept the obvious synonyms rather than making them
 # guess the one word that works.
@@ -124,7 +126,13 @@ OVERLAY_ALIASES = {"shading": "shade", "shaded": "shade", "checker": "shade",
                    "zones": "spawns", "arrows": "push", "pushes": "push",
                    "pushdirections": "push", "outline": "vision",
                    "outlines": "vision", "territory": "vision",
-                   "borders": "vision", "players": "vision"}
+                   "borders": "vision", "players": "vision",
+                   # The hyphen in "vision-each" does not survive raw word
+                   # cleanup (only a-z is kept -- see parse_overlays), so the
+                   # canonical spelling itself needs an entry here too, along
+                   # with the synonyms a player might reach for instead.
+                   "visioneach": "vision-each", "each": "vision-each",
+                   "perplayer": "vision-each", "individual": "vision-each"}
 # cv2.imread's formats, restricted to what phones and tablets actually produce.
 # The test sets alone cover three of them (jpg/png/webp), deliberately.
 #
@@ -644,6 +652,19 @@ def skipped_overlays(stdout):
         m = re.match(r"NO-OVERLAY \d+: ([a-z ]+?) --", line)
         if m:
             return m.group(1).split()
+    return []
+
+
+def vision_each_paths(stdout):
+    """Extra per-player composites polymerge wrote for --overlays vision-each,
+    as a list of absolute paths (the VISION-EACH stdout line, mirroring
+    DROPPED's "count: space-separated list" shape). Empty whenever the layer
+    was not requested, or nobody could be identified from the Game Stats icon
+    -- polymerge prints the line only when it actually wrote files."""
+    for line in (stdout or "").splitlines():
+        if line.startswith("VISION-EACH "):
+            _, _, rest = line.partition(":")
+            return [pathlib.Path(p) for p in rest.split()]
     return []
 
 
@@ -1231,9 +1252,9 @@ def help_text():
 
     It is deliberately the *whole* help rather than a pointer to a further
     command: someone who has gone looking for help should not have to ask
-    twice. That costs length -- ~1720 characters against Discord's 2000, so
-    there is little room for more. Check len() before adding a bullet; the
-    failure is the whole message vanishing, not a truncation.
+    twice. That costs length -- ~1950 characters against Discord's 2000, so
+    there is essentially no room for more. Check len() before adding a
+    bullet; the failure is the whole message vanishing, not a truncation.
 
     The layer list is built from OVERLAY_HELP rather than written out, for the
     same anti-drift reason as everything else here: a layer the parser accepts
@@ -1965,11 +1986,41 @@ async def do_merge(caller, map_size, overlays, base=None, allow_history=True):
                                 else ("layers", "exist", "they were"))
             caption += (f" No {' or '.join(gone)} {layer} {exist} for {size_txt} "
                         f"boards, so {it} left off.")
+
+        # --overlays vision-each: one extra composite per identified player,
+        # written by polymerge alongside out_path and named on the
+        # VISION-EACH stdout line (see vision_each_paths). Each gets the same
+        # oversized-upload treatment as the main composite -- they are the
+        # same resolution and can legitimately be just as large -- except a
+        # file that still won't fit is quietly dropped rather than failing
+        # the whole merge over one extra image nobody asked to see alone.
+        extra_paths = []
+        for p in vision_each_paths(stdout):
+            if not p.exists():
+                continue
+            if p.stat().st_size > MAX_UPLOAD_BYTES:
+                smaller = await asyncio.to_thread(
+                    shrink_for_upload, p, MAX_UPLOAD_BYTES)
+                if smaller is None:
+                    print(f"#{caller.channel}: dropping {p.name}, "
+                          f"couldn't get it under the upload limit",
+                          file=sys.stderr)
+                    continue
+                p = smaller
+            extra_paths.append(p)
+        if extra_paths:
+            caption += (f" Plus {len(extra_paths)} per-player view"
+                        f"{'' if len(extra_paths) == 1 else 's'} attached, "
+                        f"showing what each hasn't personally explored yet "
+                        f"as a white wash.")
+
         # out_path.name, not a hardcoded "merged.png": the upload-size
         # fallback above may have swapped in a JPEG, and labeling that .png
         # would hand clients a file whose extension lies about its contents.
-        posted = await caller.send(reply=False, content=caption,
-                                   file=discord.File(out_path, filename=out_path.name))
+        # Same for each extra path.
+        files = [discord.File(out_path, filename=out_path.name)] + [
+            discord.File(p, filename=p.name) for p in extra_paths]
+        posted = await caller.send(reply=False, content=caption, files=files)
 
         # Mark history-sourced shots consumed so the next !merge here doesn't
         # pick them up again -- but only once the composite has actually landed.

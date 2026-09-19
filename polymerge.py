@@ -3062,9 +3062,15 @@ def detect_population_bars(warped_bgr, wmask, origin, u_col, u_row, n):
 # aid, not as ground truth -- and see the confidence gate in match_head_icon
 # for what keeps a bad guess from being drawn at all.
 HEAD_ICON_DIR = "Assets/Heads"
-HEAD_ICON_CANON = 96          # shape-comparison resolution; small on purpose,
-                              # since the icon itself is a few dozen px across
-                              # in most screenshots
+HEAD_ICON_CANON = 96          # the size every button crop is normalized to
+                              # before matching, which is what lets one scale
+                              # sweep serve every capture resolution. Small on
+                              # purpose: the icon is only a few dozen px across
+                              # in most screenshots, and the whole match costs
+                              # O(area). Swept at 72/96/128/200 over 18 shots,
+                              # all four get every one right; 96 is where the
+                              # margins stop improving (0.248 against 0.225 at
+                              # 72 and 0.244 at 128) at 539ms against 942ms.
 
 # Fractional x-position of three of the four bottom-bar buttons (0=Settings,
 # 2=Tech Tree, 3=Exit/End Turn), measured over 63 portrait screenshots across
@@ -3104,20 +3110,53 @@ BUTTON_MIN_CIRCULARITY = 0.70  # contour area vs area of its own enclosing
                               # screenshot cropped mid-button
 
 
-def _button_row_candidates(img):
+def _button_row_blob_candidates(img):
     """Bright, sufficiently circular blobs in the bottom action-button band,
-    as (cx, cy, r) fractions of (w, h, w).
+    as (cx, cy, r) fractions of (w, h, w). The fast, well-tested nominator --
+    tried alone first, and sufficient by itself on the great majority of the
+    corpus.
+
+    **This is one of three independent nominators, and it is deliberately
+    the only one not asked to justify itself beyond its own shape test.**
+    _button_row_hough_candidates and _button_row_blue_candidates below key
+    on the same object from different evidence (a circular edge; a flat
+    button-colored fill) for the shots this test cannot reach, and every
+    candidate *they* produce is checked against _button_fill_is_plausible
+    before it is trusted. This function is not, because its own
+    connected-component + circularity test already implies a real,
+    unbroken ring -- re-deriving that from a handful of sampled pixels
+    would be strictly weaker evidence, not stronger, and this path is
+    exercised on nearly every shot in the corpus, so it is the one place a
+    new, unvalidated test could most easily cost something. All three
+    nominators' candidates are pooled and handed to _fit_button_row
+    together, which is the one place that actually decides what is real:
+    a nominator only ever proposes.
 
     Rejects a blob touching the image's own bottom edge: a screenshot
     physically cropped through the middle of the button row leaves a wide,
     low-circularity arc there rather than a clean ring, and a few real
-    captures in the corpus are cropped exactly that tight."""
+    captures in the corpus are cropped exactly that tight.
+
+    **No morphological close on the threshold mask, and that is deliberate --
+    a 5x5 close used to sit here and it was actively harmful.** A ring is a
+    clean shape on its own; nothing about antialiasing or JPEG noise needs a
+    dilate+erode to read it as one contour (measured: dropping the close
+    moves a passing shot's fitted (cx, cy, r) by at most 1.28/0.04/0.03px
+    across the whole corpus, and costs zero shots an anchor). What it *did*
+    do is bridge a ring to whatever bright board content -- fog, ice, sand,
+    open water, all of them near-white by the same standing decision that
+    keeps color out of fog detection -- happened to sit within a couple of
+    pixels of it, turning a clean circle plus a separate blob into one
+    low-circularity blob that clears neither test. `badland_test/oum.jpg`
+    (0 anchors -> 2) and `star_change/oum2.png` (1 -> 2) are recovered by
+    this alone. It does not touch shots whose ring merges into the board
+    through a single point of contact, or whose whole band is one
+    connected bright region -- see the two nominators below."""
     h, w = img.shape[:2]
     y0 = h - int(h * BUTTON_ROW_BOTTOM_FRAC)
     band = img[y0:, :]
     gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
     bright = (gray > BUTTON_RING_BRIGHTNESS).astype(np.uint8) * 255
-    bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
     contours, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     out = []
     for c in contours:
@@ -3135,6 +3174,355 @@ def _button_row_candidates(img):
     return out
 
 
+BUTTON_FILL_LO, BUTTON_FILL_HI = 0.62, 0.85  # annulus, in ring radii, sampled
+                                              # to test whether a candidate's
+                                              # own button fill looks real --
+                                              # inside the ring stroke, outside
+                                              # the icon glyph, on every shot
+                                              # measured (see the function below)
+BUTTON_FILL_GRAY_MAX = 90     # the flat black fill measured over 200
+                               # (shot, slot) samples across the whole corpus
+                               # sits at gray 0-2 with a p99 of 19 and a single
+                               # outlier at 44 -- 90 is a >2x margin over that
+                               # outlier, not a knife-edge
+BUTTON_FILL_STD_MAX = 30      # the same fill is *flat*: std 0-2 typically, p99
+                               # 19, one outlier at 44. This is what actually
+                               # separates a real button from dark terrain --
+                               # gray alone does not, see below
+BUTTON_FILL_BLUE_HUE = (90, 115)  # the "not your turn" recolor -- Game Stats'
+                                    # ring and Exit's whole fill turn a
+                                    # saturated blue instead of white/black
+                                    # (perilous_test/xin.png,
+                                    # scorched_earth/bard.png) -- measured
+                                    # hue 96-105 at saturation 130-220 across
+                                    # every such button found in the corpus
+BUTTON_FILL_BLUE_SAT_MIN = 130
+
+
+def _button_fill_is_plausible(img, cx, cy, r):
+    """Is the flat fill just inside this candidate's ring -- between the
+    icon glyph and the stroke, never the icon itself -- a real button's
+    fill (black, or the "not your turn" blue), rather than some patch of
+    board/terrain a noisier detector below mistook for one?
+
+    This is not a brightness test on its own, and cannot be: plenty of
+    ordinary terrain (forest, mountain shadow, deep water) is just as dark
+    as a real button's fill, which is why `basin_treaties/q.png`'s and
+    `perilous_test/xin.png`'s own dark terrain circles pass a bare
+    `gray < 90` cut and have to be caught some other way. What actually
+    separates them is *uniformity* -- a button's fill is one flat UI
+    color and terrain is not, measured at std 0-2 (p99 19) against
+    terrain's 90-103 on the exact false positives this exists to reject.
+    Requiring both catches what either alone misses: gray-but-textured
+    terrain fails the std bar, and the saturated-but-bright blue variant
+    would fail a plain gray cut without the second branch.
+
+    Consulted by _button_row_hough_candidates and
+    _button_row_blue_candidates below -- both noisier than the blob path
+    in ways this catches -- but never by the blob path itself, whose own
+    connected-component test already implies a real ring; re-deriving that
+    here from a handful of sampled pixels would be strictly weaker
+    evidence, not stronger."""
+    h, w = img.shape[:2]
+    y0 = max(0, int(cy - BUTTON_FILL_HI * r))
+    y1 = min(h, int(cy + BUTTON_FILL_HI * r) + 1)
+    x0 = max(0, int(cx - BUTTON_FILL_HI * r))
+    x1 = min(w, int(cx + BUTTON_FILL_HI * r) + 1)
+    if y1 <= y0 or x1 <= x0:
+        return False
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    d2 = (xx - cx) ** 2 + (yy - cy) ** 2
+    mask = (d2 >= (BUTTON_FILL_LO * r) ** 2) & (d2 <= (BUTTON_FILL_HI * r) ** 2)
+    pixels = img[y0:y1, x0:x1][mask]
+    if len(pixels) < 5:
+        return False
+    if pixels.mean(axis=1).std() > BUTTON_FILL_STD_MAX:
+        return False
+    if pixels.mean() < BUTTON_FILL_GRAY_MAX:
+        return True
+    hsv = cv2.cvtColor(pixels.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3).mean(axis=0)
+    return BUTTON_FILL_BLUE_HUE[0] <= hsv[0] <= BUTTON_FILL_BLUE_HUE[1] and hsv[1] >= BUTTON_FILL_BLUE_SAT_MIN
+
+
+def _button_row_hough_candidates(img):
+    """Circular button rings via Hough transform, for a ring that survives
+    intact but not *isolated* -- the blob path's connected-component test
+    cannot tell a real ring fused to the board from an actual chunk of
+    board, but a ring's edge is still a clean, unbroken circle either way,
+    which is exactly what Hough looks for instead of connectivity.
+
+    Measured on `basin_treaties/q.png`, `test_ss_elyruins/hood.png` and
+    `u_forest2/ely.png` -- shots where every one of the four buttons is
+    plainly visible and the blob path finds zero or one of them. The
+    mechanism is the same tessellated-lattice fact this codebase already
+    relies on for the fog test elsewhere: the board art is one continuous
+    mesh of touching bright facets, its lower boundary is jagged rather
+    than a clean line (the same scalloped-lip shape the fog cube's own
+    silhouette has), and on these particular captures one facet's point
+    happens to reach down far enough to touch a ring's stroke by a pixel
+    or two -- fusing the *entire* board mesh and that ring into one
+    connected component. (On `basin_treaties/q.png` the touch is the
+    board's own silhouette edge doing the same thing at a coarser scale.)
+    Nothing decorative is involved and no game-drawn element is at fault;
+    it is the ordinary lattice boundary's own irregularity meeting a ring
+    by chance, on these specific device/board combinations.
+
+    **Hough alone is not enough -- it is noisy in a way the blob path
+    structurally cannot be, and that is what _button_fill_is_plausible is
+    for.** A tessellated fog/ice pattern is full of circular-ish gradient
+    structure, including at plausible button radii and spacing:
+    `missized_test/z1.jpg`, a screenshot with no button row in frame at
+    all (confirmed with the project owner), produces two Hough circles
+    whose x-fractions happen to sum to 1.00 -- a real button pair's
+    signature, from a board with no buttons. Every one of that shot's
+    circles sits on bright, textured fog and fails the fill check.
+
+    Deliberately only run as a fallback: it costs a Gaussian blur plus a
+    Hough transform on every shot that reaches it, which the blob path's
+    fast case never pays.
+
+    Same (cx, cy, r) fraction convention as _button_row_blob_candidates,
+    so the lists from all three nominators concatenate directly."""
+    h, w = img.shape[:2]
+    y0 = h - int(h * BUTTON_ROW_BOTTOM_FRAC)
+    band = img[y0:, :]
+    gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 1.2)
+    min_r = max(1, int(0.015 * w))
+    max_r = max(min_r + 1, int(0.11 * w))
+    circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, dp=1.5,
+                                minDist=int(0.08 * w), param1=80, param2=40,
+                                minRadius=min_r, maxRadius=max_r)
+    if circles is None:
+        return []
+    out = []
+    for cx, cy, r in circles[0]:
+        cy_abs = cy + y0
+        if cy_abs + r > h - 2:
+            continue
+        if not _button_fill_is_plausible(img, cx, cy_abs, r):
+            continue
+        out.append((cx / w, cy_abs / h, r / w))
+    return out
+
+
+BUTTON_BLUE_MIN_CIRCULARITY = 0.30  # far looser than the blob path's 0.70:
+                                     # Exit's solid recolored disc is as clean
+                                     # a circle as any button (measured
+                                     # circ 0.97), but Game Stats' recolored
+                                     # *ring* is thin and broken by its own
+                                     # tribe glyph reaching the stroke
+                                     # (measured 0.42-0.43) -- geometry this
+                                     # weak is exactly what
+                                     # _button_fill_is_plausible and
+                                     # _fit_button_row's own row model exist
+                                     # to arbitrate, not this test
+
+
+def _button_row_blue_candidates(img):
+    """Saturated-blue blobs in the button band -- Exit's whole fill, or
+    Game Stats' ring -- for the "not your turn" recolor state neither of
+    the other two nominators can see at all.
+
+    This is a different game state, not a capture artifact: per the
+    project owner, Game Stats' ring and Exit's fill both turn a saturated
+    blue instead of white/black while waiting on another player, and nothing
+    about that state is a *ring* the way the other three buttons still are
+    -- Exit becomes a filled disc with no stroke to speak of, so neither
+    the blob path's white-ring threshold nor Hough's circular-edge search
+    has anything to find there regardless of the board behind it. Direct
+    color thresholding is the only nominator that can propose this button
+    at all, on any shot.
+
+    Measured across the corpus at hue 96-105, saturation 130-220 -- the
+    same range `_button_fill_is_plausible` accepts, which is deliberate:
+    both are reading the same paint. Real terrain blue (water, ice) reads
+    nowhere near this saturated: the false candidates this must reject in
+    `perilous_test/xin.png` peak at S=33, one fifth of the real button's
+    floor.
+
+    `perilous_test/xin.png` is the shot in the corpus this recovers. Its
+    one candidate (Exit) joins two Hough-found white rings (Settings, Tech
+    Tree) for a clean 3-point fit, d agreeing to under 0.001 across all
+    three.
+
+    **It does not recover Game Stats, and cannot in general.** Game
+    Stats' own tribe glyph is not a small icon on a mostly-empty fill the
+    way the other three buttons' icons are (see `HEAD_SCALE_LO/HI`'s own
+    note that this icon's size relative to its button varies and is often
+    large) -- so `_button_fill_is_plausible`'s sampling annulus lands on
+    glyph edge, not flat paint, and correctly refuses it. Measured on
+    `scorched_earth/bard.png`: its Game Stats candidate reads std 35 (over
+    `BUTTON_FILL_STD_MAX`) and a mean hue of 82 (outside the blue band),
+    both a direct consequence of the glyph, and that shot is left with
+    only its one verified Exit candidate -- correctly not enough on its
+    own, for the same reason a single anchor from any nominator never is.
+    This is the same fact this codebase has stated since the head-matching
+    feature was built ("Game Stats itself is essentially never a
+    candidate"), showing up again in a new detector rather than a new
+    problem.
+
+    Same (cx, cy, r) fraction convention as the other two nominators."""
+    h, w = img.shape[:2]
+    y0 = h - int(h * BUTTON_ROW_BOTTOM_FRAC)
+    band = img[y0:, :]
+    hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
+    mask = ((hsv[:, :, 0] >= BUTTON_FILL_BLUE_HUE[0]) & (hsv[:, :, 0] <= BUTTON_FILL_BLUE_HUE[1]) &
+            (hsv[:, :, 1] >= BUTTON_FILL_BLUE_SAT_MIN) & (hsv[:, :, 2] >= 100)).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < 150:
+            continue
+        (cx, cy), r = cv2.minEnclosingCircle(c)
+        if r < 0.015 * w or r > 0.11 * w:
+            continue
+        if area / (np.pi * r * r) < BUTTON_BLUE_MIN_CIRCULARITY:
+            continue
+        cy_abs = cy + y0
+        if cy_abs + r > h - 2:
+            continue
+        if not _button_fill_is_plausible(img, cx, cy_abs, r):
+            continue
+        out.append((cx / w, cy_abs / h, r / w))
+    return out
+
+
+BUTTON_ROW_FIT_MAX_RESID = 0.006  # calibrated below: every genuine fit in
+                                   # the corpus lands under 0.003; this is a
+                                   # 2x margin, not a knife-edge
+BUTTON_ROW_RADIUS_RATIO = 1.35    # every button on the row renders at the
+                                   # same size, so a real triple's radii
+                                   # should barely differ; loose enough for
+                                   # ordinary measurement noise, tight
+                                   # enough to reject a same-brightness blob
+                                   # of a genuinely different size
+
+
+def _fit_button_row(cands):
+    """Explain 2, 3 or 4 of these raw (cx, cy, r) button-row candidates as
+    one evenly-spaced, screen-centered row -- slot i in 0..3 at
+    cx = 0.5 + (i - 1.5) * d for one shared d, confirmed on the calibration
+    corpus (BUTTON_ROW_ANCHOR_X's idx0/idx3 sum to 0.999, and idx2 sits a
+    third as far from center as idx0/idx3 -- exactly the 0.5d/1.5d ratio
+    this model predicts). This is the one place that actually decides what
+    is real: every candidate from every nominator above is a proposal, not
+    a claim, and only a self-consistent subset of them is ever trusted.
+
+    This is a different *kind* of evidence from matching a candidate
+    against BUTTON_ROW_ANCHOR_X's fixed, corpus-averaged fractions: fitting
+    k points to a 1-parameter family (one shared d) is over-determined for
+    any k >= 2, so a tight fit is real corroboration regardless of what
+    this device's own spacing actually is -- which is exactly what a
+    device whose spacing differs from the portrait-calibration corpus
+    needs and the fixed table cannot give it. `test_screenshots/h.jpg` and
+    `test_ss_2/hood.jpg` place Tech Tree and End Turn only 0.084 apart
+    against the corpus's own 0.189 average -- both landed inside idx=2's
+    tolerance window and neither close enough to idx=3, so the fixed-table
+    match silently produced a wrong crop from two buttons crowding one
+    slot (two of the corpus's previously-unexplained mismatches; see
+    CLAUDE.md). Fit on their own three visible buttons instead (Settings,
+    Tech Tree, End Turn -- Game Stats itself is essentially never a
+    candidate, per _button_row_blob_candidates' own note about its
+    interior), this device's real d=0.084 falls out directly, residual
+    0.0002.
+
+    Verified against every shot in the corpus with 3+ raw candidates (66 of
+    77): all 66 fit this model on indices {0, 2, 3} at a residual under
+    0.003, none at any other index triple, and none rejected -- so the
+    threshold below has a 2x margin on the whole corpus, not a fitted
+    edge.
+
+    **k=2 is the same fit, not a separate case, and that is the point of
+    writing it this way.** It used to be special-cased to symmetric slot
+    pairs only ({0,3} or {1,2}), on the reasoning that two points fit
+    *some* 2-slot hypothesis trivially so only a mirror pair -- checkable
+    by nothing but `p + q == 1`, without needing to know d at all -- was
+    real evidence. That reasoning proves too little: the least-squares fit
+    above is *exactly as over-determined* for any two distinct slot
+    indices, symmetric or not, because the model's intercept is fixed at
+    the screen's own center (0.5) rather than fitted -- two equations,
+    one unknown d, one residual to check, whichever pair of slots is
+    tried. Symmetric pairs are simply the case where that check reduces to
+    `p + q ~= 1` by algebra (worked out and confirmed: solving the
+    weighted least squares for u = (-1.5, 1.5) or (-0.5, 0.5) reproduces
+    the old `gap/3` and `gap` formulas exactly), not a different or
+    stronger kind of evidence than an asymmetric pair like {1, 3}.
+
+    That generality is load-bearing on four shots that were previously
+    invisible to the k=2 case entirely: `archers_test2/yad.png` resolves
+    on {2, 3}, `control_c/ai.png` and `scorched_earth/lux.jpg` on {0, 2},
+    none of them symmetric and so none reachable by the old
+    mirror-pair-only special case however tightly the two points agreed.
+    `star_change/oum2.png` still resolves on the one symmetric pair {0, 3}
+    the old case already handled, unchanged. The old case's one real
+    advantage -- deciding between a pair's two symmetric readings (spacing
+    d for {1,2}, or 3d for {0,3}) without an extra assumption -- is now
+    just one more entry in the same `slot_idxs` search the k=3/4 case
+    already runs, resolved as whichever reading actually clears the
+    residual bar rather than by tiebreaking against a corpus average.
+
+    It is *not* what saves `scorched_earth/bard.png`, which is worth
+    recording since it looks like it should be: that shot's board mesh
+    fuses so much of the row into one blob that no nominator recovers a
+    white ring, and while Exit's recolored fill is found and verified,
+    Game Stats' recolored ring is not -- its own tribe glyph is large
+    enough that the fill-plausibility check samples glyph edge rather than
+    flat paint (see `_button_row_blue_candidates`) and correctly refuses
+    it. One verified candidate is exactly as insufficient here as it is
+    anywhere else in this file, so that shot still declines.
+
+    **The best fit wins on (most points, then lowest residual), not the
+    first one found**, which matters most exactly here: with more than a
+    couple of candidates in play (routine once the noisier nominators are
+    in the mix) more than one k=2 reading can clear the residual bar, and
+    there is no basis for preferring whichever `combinations()` happens to
+    reach first.
+
+    Returns (d, {idx: (cx, cy, r)}) for the best fit, or None if nothing
+    fits tightly enough at any k."""
+    cands = sorted(cands, key=lambda c: c[0])
+    n = len(cands)
+    best = None
+    for k in (4, 3, 2):
+        if n < k:
+            continue
+        for cand_idxs in itertools.combinations(range(n), k):
+            pts = [cands[i] for i in cand_idxs]
+            rs = [p[2] for p in pts]
+            if max(rs) > BUTTON_ROW_RADIUS_RATIO * min(rs):
+                continue
+            for slot_idxs in itertools.combinations(range(4), k):
+                u = np.array([i - 1.5 for i in slot_idxs])
+                xs = np.array([p[0] - 0.5 for p in pts])
+                d = float((u * xs).sum() / (u * u).sum())
+                resid = float(np.max(np.abs(0.5 + u * d - np.array([p[0] for p in pts]))))
+                if resid > BUTTON_ROW_FIT_MAX_RESID:
+                    continue
+                if best is None or (k, -resid) > (best[0], -best[1]):
+                    best = (k, resid, d, dict(zip(slot_idxs, pts)))
+    if best is None:
+        return None
+    _, _, d, slot_map = best
+    return d, slot_map
+
+
+def _merge_button_candidates(base, extra):
+    """base + extra, dropping anything in extra that sits within 0.01 (x
+    and y) of a candidate base already has. A second nominator finding the
+    same real button is corroboration, not a second data point for
+    _fit_button_row to weigh -- and without this, a near-duplicate pair
+    both entering the k-search would cost nothing on a correct fit but
+    could let two near-identical readings of the same noise source pass
+    for independent agreement."""
+    out = list(base)
+    for c in extra:
+        if not any(abs(c[0] - b[0]) < 0.01 and abs(c[1] - b[1]) < 0.01 for b in out):
+            out.append(c)
+    return out
+
+
 def locate_game_stats_icon(img):
     """Where the Game Stats button's icon sits in this (raw, unwarped)
     screenshot, as (cx, cy, r) in pixels.
@@ -3144,13 +3532,53 @@ def locate_game_stats_icon(img):
     that a bad guess here is caught later by match_head_icon's confidence
     gate rather than by refusing to look. Callers that need to know whether
     the position is actually trustworthy should count anchors themselves --
-    see how main() gates on it before ever calling this."""
+    see how main() gates on it before ever calling this.
+
+    Tries the row fit above first (see _fit_button_row for why it is
+    stronger evidence than matching against a fixed position table), and
+    only falls back to that fixed table -- BUTTON_ROW_ANCHOR_X, calibrated
+    on 63 portrait screenshots -- when nothing fits at all. **A duplicate
+    index in that fallback must not count as two anchors**: two distinct
+    real buttons can both fall inside one anchor's tolerance window (see
+    _fit_button_row's docstring for the worked case), which would
+    otherwise hand the regression two points sharing one index -- a
+    singular system whose minimum-norm solution silently produces *some*
+    crop rather than raising. Keep only the closer-to-canonical candidate
+    per index before counting or fitting, so two buttons contending for
+    one slot cost this shot an anchor rather than fabricating one from
+    noise.
+
+    **The two noisier nominators run only when the fast blob path's own
+    fit fails, and run together rather than staged one after the other.**
+    There is no ordering reason to prefer Hough's candidates over the blue
+    detector's or the reverse -- they key on different, non-overlapping
+    render states (a merged-but-intact white ring; a "not your turn"
+    recolor with no ring to find at all) -- and `_fit_button_row` is what
+    actually arbitrates whichever of them turn out to be real, exactly as
+    it does for the blob path's own candidates. The fast, well-tested blob
+    path runs and is tried alone first on every shot; the extra cost below
+    is paid only by the minority that reach here with nothing to show for
+    it otherwise."""
     h, w = img.shape[:2]
-    anchors = []
-    for cx, cy, r in _button_row_candidates(img):
+    cands = _button_row_blob_candidates(img)
+    fit = _fit_button_row(cands)
+    if fit is None:
+        cands = _merge_button_candidates(cands, _button_row_hough_candidates(img))
+        cands = _merge_button_candidates(cands, _button_row_blue_candidates(img))
+        fit = _fit_button_row(cands)
+    if fit is not None:
+        d, slot_map = fit
+        cx = 0.5 - 0.5 * d
+        cy = float(np.median([p[1] for p in slot_map.values()]))
+        r = float(np.median([p[2] for p in slot_map.values()]))
+        return int(round(cx * w)), int(round(cy * h)), int(round(r * w)), len(slot_map)
+    by_idx = {}
+    for cx, cy, r in cands:
         idx, canon_x = min(BUTTON_ROW_ANCHOR_X.items(), key=lambda kv: abs(cx - kv[1]))
-        if abs(cx - canon_x) < BUTTON_ROW_MATCH_TOL:
-            anchors.append((idx, cx, cy, r))
+        d = abs(cx - canon_x)
+        if d < BUTTON_ROW_MATCH_TOL and (idx not in by_idx or d < by_idx[idx][0]):
+            by_idx[idx] = (d, cx, cy, r)
+    anchors = [(idx, cx, cy, r) for idx, (d, cx, cy, r) in by_idx.items()]
     if len(anchors) >= 2:
         idxs = np.float32([a[0] for a in anchors])
         xs = np.float32([a[1] for a in anchors])
@@ -3176,26 +3604,113 @@ GAME_STATS_Y_FALLBACK = 0.90
 GAME_STATS_R_FALLBACK = 0.065
 
 
-def head_icon_patch(img, cx, cy, r):
-    """The Game Stats icon's own square crop and a mask of its interior,
-    inset off the white ring (which carries no tribe information and would
-    only dilute the match). None if the location is degenerate."""
-    x0, x1 = max(cx - r, 0), min(cx + r, img.shape[1])
-    y0, y1 = max(cy - r, 0), min(cy + r, img.shape[0])
-    if x1 - x0 < 8 or y1 - y0 < 8:
+# The crop handed to the matcher, as a multiple of the button's own ring
+# radius. It has to be wide enough that the head is wholly inside it at the
+# largest scale the sweep below tries (1.85 radii tall), with room for the
+# match to slide; 1.4 gives that with a little margin and nothing more, since
+# every extra pixel is background the correlation has to explain away.
+HEAD_ICON_REGION = 1.4
+# The head's own height, in button-ring radii. Measured over 16 shots spanning
+# the corpus: 1.235 to 1.742, mean 1.503, sd 0.131. It is *not* a constant --
+# the icon does not fill a fixed fraction of its button -- which is why this is
+# swept rather than assumed. The old code assumed one (a 0.78-of-radius
+# interior circle) and that was the single largest cause of lost recall.
+HEAD_SCALE_LO, HEAD_SCALE_HI, HEAD_SCALE_STEPS = 1.15, 1.85, 8
+HEAD_ICON_MIN_PIXELS = 60       # too little sprite left to say anything
+HEAD_SPRITE_MAX = 256           # catalog sprites are stored no larger than
+                                # this on their long side; they are only ever
+                                # rendered at a fraction of HEAD_ICON_CANON,
+                                # and the assets ship at up to 1024x1024.
+
+# Head scale is a property of the *icon*, not of the screenshot -- each
+# tribe/skin's own art is drawn at a fixed size relative to its button ring,
+# and it is the button-to-button variation across the 29 catalog entries that
+# makes HEAD_SCALE_LO..HI as wide as it is, not variation across captures of
+# one icon. Measured over every confidently-identified corpus shot (NCC>=0.55,
+# margin>=0.15, so a shaky identification cannot poison another tribe's
+# calibration): the within-entry spread across different screenshots -- often
+# different devices -- of the *same* icon is 0.00-0.06 (mean 0.024, n=19
+# entries with 2+ observations), while the entries themselves range center
+# 1.22-1.74. So once an icon's own scale is known, resweeping the full
+# HEAD_SCALE_LO..HI range for it on every shot is paying for per-capture
+# uncertainty that the data says is not there.
+#
+# HEAD_SCALE_BY_ENTRY centers a narrow +-HEAD_SCALE_ENTRY_TOL band on each
+# calibrated entry's own mean instead. The tolerance is 2.7x the largest
+# within-entry spread actually observed (0.06, x.png and y.png), and the band
+# is still searched at HEAD_SCALE_ENTRY_STEPS steps -- 0.053 apart, finer than
+# the old global sweep's ~0.10 -- so a calibrated entry is matched *more*
+# precisely at roughly half the per-entry cost (4 steps against 8). An entry
+# the corpus happens to hold no confident shot of (10 of 29 -- rarer skins:
+# Ai-Mo, Aquarion base and Forgotten, Bardur base and skin, Elyrion's Midnight
+# skin, Vengir's own base render, Vengir's other skin, Luxidoor's skin,
+# Quetzali's skin) keeps the full, unnarrowed sweep, since there is nothing to
+# calibrate it against -- narrowing on no evidence is exactly the mistake
+# HEAD_SCALE_LO/HI itself replaced (see that constant's own history).
+HEAD_SCALE_ENTRY_TOL = 0.08
+HEAD_SCALE_ENTRY_STEPS = 4
+HEAD_SCALE_BY_ENTRY = {
+    "x2.png": 1.220, "ai2.png": 1.270, "i2.png": 1.270, "c.png": 1.292,
+    "x.png": 1.360, "c2.png": 1.390, "y.png": 1.405, "p.png": 1.420,
+    "i.png": 1.440, "z.png": 1.480, "l.png": 1.510, "v2.png": 1.540,
+    "e.png": 1.550, "o.png": 1.571, "q.png": 1.600, "h.png": 1.620,
+    "y2.png": 1.620, "k.png": 1.740, "h2.png": 1.740,
+}
+
+
+def _head_scale_sweep(name):
+    """Scale candidates to try for one catalog entry: a narrow, calibrated
+    band around its own measured scale when one exists, else the full
+    uncalibrated sweep. See HEAD_SCALE_BY_ENTRY above."""
+    center = HEAD_SCALE_BY_ENTRY.get(name)
+    if center is None:
+        return np.linspace(HEAD_SCALE_LO, HEAD_SCALE_HI, HEAD_SCALE_STEPS)
+    lo = max(HEAD_SCALE_LO, center - HEAD_SCALE_ENTRY_TOL)
+    hi = min(HEAD_SCALE_HI, center + HEAD_SCALE_ENTRY_TOL)
+    return np.linspace(lo, hi, HEAD_SCALE_ENTRY_STEPS)
+
+
+def head_icon_region(img, cx, cy, r):
+    """The Game Stats button's neighbourhood, normalized to a fixed canonical
+    size, as float32 -- or None if the location is degenerate.
+
+    Normalizing by the *button radius* is what makes one scale sweep serve
+    every device: after this the head is always between HEAD_SCALE_LO and
+    HEAD_SCALE_HI canonical radii tall whatever the capture's resolution.
+
+    Note this deliberately returns the whole square neighbourhood and applies
+    no interior circle. The ring and the rank badge are inside it, and are
+    handled where they belong -- by masking to the *sprite's* own alpha at
+    match time, so only pixels a candidate head actually claims are ever
+    compared. Cutting a fixed circle here instead threw away part of the head
+    on some captures and kept ring on others."""
+    R = int(round(r * HEAD_ICON_REGION))
+    if R < 8:
         return None
-    patch = img[y0:y1, x0:x1]
-    mask = np.zeros(patch.shape[:2], np.uint8)
-    center = ((x1 - x0) // 2, (y1 - y0) // 2)
-    cv2.circle(mask, center, int(min(center) * 0.78), 255, -1)
-    return patch, mask
+    pad = max(0, R - cy, R - cx, cy + R - img.shape[0], cx + R - img.shape[1])
+    if pad > 0:
+        img = cv2.copyMakeBorder(img, pad, pad, pad, pad,
+                                 cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        cx, cy = cx + pad, cy + pad
+    box = img[cy - R:cy + R, cx - R:cx + R]
+    if box.shape[0] < 8 or box.shape[1] < 8:
+        return None
+    return cv2.resize(box, (HEAD_ICON_CANON, HEAD_ICON_CANON),
+                      interpolation=cv2.INTER_AREA).astype(np.float32)
 
 
-PLAYER_HEAD_MIN_CORR = 0.25     # floor on the winning entry's own score
-PLAYER_HEAD_MIN_MARGIN = 0.02   # lead it must hold over the runner-up
-HEAD_ICON_BLACK_FLOOR = 10      # screenshot pixels this dark are the black
-                                # button background leaking into the interior
-                                # mask (see match_head_icon), not icon art
+PLAYER_HEAD_MIN_CORR = 0.55     # floor on the winning entry's own score
+PLAYER_HEAD_MIN_MARGIN = 0.10   # lead it must hold over the runner-up
+HEAD_CLUSTER_MIN_NCC = 0.90     # two shots' own icons this alike are one player
+HEAD_SAME_ICON_NCC = 0.98       # ...and this alike are the *same icon*, so the
+                                # second one need not be matched against the
+                                # catalog at all. That matters because the two
+                                # costs are nothing like each other: correlating
+                                # two shots is 0.2ms for every pair in a merge,
+                                # while one catalog match is ~480ms (29 sprites
+                                # x 8 scales). Sitting far above the 0.926 of
+                                # the closest genuinely-different pair in the
+                                # corpus, this can only ever collapse work.
 
 _head_catalog_cache = None
 
@@ -3209,21 +3724,26 @@ def head_icon_dir():
 
 
 def load_head_catalog():
-    """Every Assets/Heads/*.png as a (color, interior-mask) pair at
-    HEAD_ICON_CANON resolution, keyed by filename, cached at module scope --
-    the catalog is fixed for the life of the process and every identified
-    shot in a merge probes all of it. One entry per tribe/skin, confirmed
-    with the project owner -- there is nothing in this catalog to deduplicate.
+    """Every Assets/Heads/*.png as a (premultiplied color, alpha) pair at its
+    own native aspect ratio, keyed by filename, cached at module scope.
 
-    Composited over black (matching the button's own dark fill, not white)
-    and cropped to the sprite's own alpha extent before resizing, the same
-    treatment the real screenshot crop gets in match_head_icon so the two
-    sides are comparable."""
+    Composited over black, matching the button's own dark fill, and cropped to
+    the sprite's own alpha extent -- but **not** resized to a square. That
+    squash was a real defect rather than a detail: the alpha extents run from
+    aspect 0.561 to 1.169 across the 29 assets, so forcing each to a square
+    stretched every candidate by a different amount, up to 45%, and then
+    compared them against an undistorted screenshot. Correct matches topped
+    out near 0.54 because of it; with the aspect kept they reach 0.94-0.99.
+
+    Downsampled once to HEAD_SPRITE_MAX on its long side, because the match
+    only ever renders these at a fraction of HEAD_ICON_CANON and rescaling a
+    1024x1024 asset down to ~100px on every one of 8 scale candidates x 29
+    entries was most of this phase's cost -- 478ms a shot against 104ms with
+    the cap, for scores identical to three decimals."""
     global _head_catalog_cache
     if _head_catalog_cache is not None:
         return _head_catalog_cache
     cat = {}
-    C = HEAD_ICON_CANON
     for f in sorted(glob.glob(os.path.join(head_icon_dir(), "*.png"))):
         im = cv2.imread(f, cv2.IMREAD_UNCHANGED)
         if im is None or im.ndim != 3 or im.shape[2] != 4:
@@ -3233,101 +3753,198 @@ def load_head_catalog():
         if len(xs) == 0:
             continue
         x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
-        bgr = im[:, :, :3].astype(np.float32)
         a = (alpha.astype(np.float32) / 255.0)[:, :, None]
-        comp = (bgr * a)[y0:y1, x0:x1]
-        amask = (alpha[y0:y1, x0:x1] > 8).astype(np.uint8) * 255
-        color = cv2.resize(comp, (C, C), interpolation=cv2.INTER_AREA)
-        amask = cv2.resize(amask, (C, C), interpolation=cv2.INTER_AREA)
-        pm = np.zeros((C, C), np.uint8)
-        cv2.circle(pm, (C // 2, C // 2), int(C // 2 * 0.78), 255, -1)
-        cat[os.path.basename(f)] = (color, (amask > 0) & (pm > 0))
+        comp = (im[:, :, :3].astype(np.float32) * a)[y0:y1, x0:x1]
+        amask = alpha[y0:y1, x0:x1].astype(np.float32) / 255.0
+        long_side = max(comp.shape[:2])
+        if long_side > HEAD_SPRITE_MAX:
+            k = HEAD_SPRITE_MAX / long_side
+            wh = (max(int(round(comp.shape[1] * k)), 1),
+                  max(int(round(comp.shape[0] * k)), 1))
+            comp = cv2.resize(comp, wh, interpolation=cv2.INTER_AREA)
+            amask = cv2.resize(amask, wh, interpolation=cv2.INTER_AREA)
+        cat[os.path.basename(f)] = (comp, amask)
     _head_catalog_cache = cat
     return cat
 
 
-def match_head_icon(patch, mask, catalog):
-    """The catalog filename this icon crop looks most like, as (key, ncc), or
-    None if nothing clears the confidence gate.
+def _head_scores(region, catalog):
+    """Every catalog entry's best masked correlation against this region, as
+    {filename: ncc}, searching scale and position.
 
-    Correlation is over color (all three BGR channels). Tribe/skin heads
-    render identically and are consistent per player in the game, so color
-    is helpful for matching. We assume only one player per tribe/skin and
-    render vision borders in the corresponding colors for all those
-    screenshots.
+    Three things make this work where a single fixed comparison did not, and
+    all three are about geometry rather than about color:
+      * the sprite keeps its aspect (see load_head_catalog);
+      * only the sprite's own alpha is compared, so the button's white ring,
+        its black fill and the rank badge in the corner are never scored --
+        they are simply not part of any candidate head;
+      * the head's size is searched rather than assumed, because it is not a
+        fixed fraction of the button (see HEAD_SCALE_LO) -- though it *is*
+        fixed per icon, which is what narrows the search per entry (see
+        HEAD_SCALE_BY_ENTRY).
 
-    It is still mean-centered per match the same way sample_tile's fog test
-    mean-centers the pixels it compares, over all three channels pooled into
-    one vector --
-    that survives a device's overall color cast (a warm or cool white
-    balance shifts every channel by roughly the same amount) the same way
-    mean-centering survives an ordinary brightness shift, without needing to
-    fit anything as elaborate as fog_illumination's per-channel gain.
-
-    The gate has two parts and both matter. The floor rejects a crop that
-    resembles nothing in the catalog at all (an uncatalogued tribe, or a
-    badly-placed crop). The margin rejects a genuine tie between two
-    different catalog entries -- neither bound is tightly calibrated (the
-    corpus gives maybe a couple dozen usable samples per tribe at best), so a
-    drawn boundary is a best-effort aid, not a claim of certainty, which is
-    why this feature is opt-in.
-
-    Screenshot pixels darker than HEAD_ICON_BLACK_FLOOR are dropped before
-    correlating. head_icon_patch's interior circle doesn't always land
-    exactly on the icon glyph -- it can include a ring of the button's own
-    black background, and correlating that against a catalog entry's (never
-    black) pixels is just noise for every candidate. Excluding it fixed a
-    real case: an Elyrion screenshot (e.png) that was tying with, and
-    sometimes losing to, Ai-Mo's To-Li skin (ai2.png) despite the two
-    sharing no dominant color at all -- and it strengthened every other
-    match checked alongside it too."""
+    matchTemplate locates each scale cheaply, then the masked correlation is
+    evaluated in a 3x3 window around that peak: the unmasked peak is close but
+    not always exact, since the ring it can see and the mask cannot pulls it a
+    pixel or two."""
     C = HEAD_ICON_CANON
-    color = cv2.resize(patch, (C, C), interpolation=cv2.INTER_AREA).astype(np.float32)
-    pm = cv2.resize(mask, (C, C), interpolation=cv2.INTER_NEAREST) > 0
-    gray = cv2.cvtColor(color.astype(np.uint8), cv2.COLOR_BGR2GRAY)
-    pm = pm & (gray >= HEAD_ICON_BLACK_FLOOR)
-    scores = []
-    for name, (tcolor, tmask) in catalog.items():
-        m = pm & tmask
-        if m.sum() < 200:
-            continue
-        a = color[m].ravel()
-        b = tcolor[m].ravel()
-        a = a - a.mean()
-        b = b - b.mean()
-        den = float(np.sqrt((a * a).sum() * (b * b).sum()))
-        ncc = float((a * b).sum() / den) if den > 0 else 0.0
-        scores.append((ncc, name))
+    rr = C / (2.0 * HEAD_ICON_REGION)       # the button's radius, canonically
+    scores = {}
+    for name, (comp, amask) in catalog.items():
+        best = -1.0
+        for hr in _head_scale_sweep(name):
+            th = int(round(rr * hr))
+            if th < 8:
+                continue
+            tw = int(round(comp.shape[1] * (th / comp.shape[0])))
+            if tw < 8 or tw >= C or th >= C:
+                continue
+            t = cv2.resize(comp, (tw, th), interpolation=cv2.INTER_AREA)
+            m = cv2.resize(amask, (tw, th), interpolation=cv2.INTER_AREA) > 0.5
+            if int(m.sum()) < HEAD_ICON_MIN_PIXELS:
+                continue
+            b = t[m].ravel()
+            b = b - b.mean()
+            nb = float(np.sqrt((b * b).sum()))
+            if nb <= 0:
+                continue
+            res = cv2.matchTemplate(region, t, cv2.TM_CCOEFF_NORMED)
+            oy, ox = np.unravel_index(int(res.argmax()), res.shape)
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    Y, X = oy + dy, ox + dx
+                    if Y < 0 or X < 0 or Y + th > C or X + tw > C:
+                        continue
+                    a = region[Y:Y + th, X:X + tw][m].ravel()
+                    a = a - a.mean()
+                    na = float(np.sqrt((a * a).sum()))
+                    if na > 0:
+                        best = max(best, float((a * b).sum()) / (na * nb))
+        if best > -1.0:
+            scores[name] = best
+    return scores
+
+
+def match_head_icon(region, catalog):
+    """The catalog filename this icon region looks most like, as (key, ncc),
+    or None if nothing clears the confidence gate.
+
+    Correlation is over color (all three BGR channels pooled and mean-centred
+    as one vector). A tribe/skin's head renders in one fixed palette whoever
+    is looking at it, so color is real signal here rather than noise.
+
+    It is worth knowing what color does *not* survive, since the code used to
+    claim it did: two captures of the identical icon can differ by a chroma
+    transform -- measured on one corpus pair as a 3x3 matrix in linear light
+    whose rows sum to 1.0, explaining 99.8% of the difference, i.e. a gamut
+    conversion between capture pipelines. It leaves the neutral axis untouched
+    at every lightness and moves saturated pixels in proportion to their
+    chroma. Mean-centring does not undo that, and no per-channel correction
+    does either. It cost a correct match once, when the margin budget was 0.02
+    and the geometry above was throwing away most of the signal; against the
+    0.2-0.6 margins this now returns it is immaterial.
+
+    The gate has two parts. The floor rejects a region that resembles nothing
+    catalogued -- an uncatalogued tribe or skin, which really happens (the
+    corpus has an Oumaji shot wearing the Khondor skin, which is not in
+    Assets/Heads and scores 0.39 against base Oumaji). The margin rejects a
+    genuine tie. Both sit far below what a correct match returns: over the
+    corpus those run 0.83-0.99 at margins of 0.20-0.59."""
+    scores = _head_scores(region, catalog)
     if not scores:
         return None
-    scores.sort(reverse=True)
-    top_ncc, top_name = scores[0]
-    runner_up = scores[1][0] if len(scores) > 1 else -1.0
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+    top_name, top_ncc = ranked[0]
+    runner_up = ranked[1][1] if len(ranked) > 1 else -1.0
     if top_ncc < PLAYER_HEAD_MIN_CORR or top_ncc - runner_up < PLAYER_HEAD_MIN_MARGIN:
         return None
     return top_name, top_ncc
 
 
-def identify_player(img, catalog):
-    """(player_key, ncc) for one raw screenshot, or None if it cannot be
-    identified with any confidence.
+def player_icon_region(img):
+    """This screenshot's own Game Stats icon, canonically framed, or None.
 
     Requires at least two real button-row anchors (see locate_game_stats_icon)
-    before attempting a match. Zero anchors means the icon location is just
-    a corpus-average guess with no evidence behind it, and one anchor is
-    barely better -- the position is extrapolated from an average spacing
-    rather than anything measured on this shot, and can land badly. Both
-    cases were measured producing confident wrong matches that no score
+    before believing the position. Zero anchors means it is a corpus-average
+    guess with no evidence behind it, and one anchor is barely better -- the
+    position is extrapolated from an average spacing rather than anything
+    measured on this shot, and can land on a neighbouring button entirely.
+    Both were measured producing confident wrong matches that no score
     threshold could catch, so both are excluded up front."""
-    if not catalog:
-        return None
     cx, cy, r, n_anchors = locate_game_stats_icon(img)
     if n_anchors < 2:
         return None
-    patch = head_icon_patch(img, cx, cy, r)
-    if patch is None:
+    return head_icon_region(img, cx, cy, r)
+
+
+def identify_player(img, catalog):
+    """(player_key, ncc) for one raw screenshot, or None if it cannot be
+    identified with any confidence."""
+    if not catalog:
         return None
-    return match_head_icon(patch[0], patch[1], catalog)
+    region = player_icon_region(img)
+    if region is None:
+        return None
+    return match_head_icon(region, catalog)
+
+
+def icon_similarity(a, b):
+    """How alike two canonically-framed icon regions are, as a plain NCC over
+    all three channels pooled. Both sides come from screenshots, so there is
+    nothing here that mean-centring does not already cover -- which is the
+    whole reason this question is so much easier than naming the tribe."""
+    u = a.ravel() - a.mean()
+    v = b.ravel() - b.mean()
+    d = float(np.sqrt((u * u).sum() * (v * v).sum()))
+    return float((u * v).sum()) / d if d > 0 else 0.0
+
+
+def group_shots_by_icon(region_of):
+    """Group shot names by whose Game Stats icon they carry, as a list of
+    lists, without consulting the catalog at all.
+
+    Two screenshots are compared against *each other* rather than against a
+    reference render, which is a far easier question than naming the tribe:
+    they share a renderer, a ring, a badge position and usually a device, so
+    nothing has to be bridged. Measured over every within-set pair in the
+    corpus, same-player pairs correlate 0.926-1.000 and different-player pairs
+    0.017-0.837 -- populations that do not overlap.
+
+    That matters beyond robustness: grouping is what a per-player view
+    actually needs, and it keeps working for a tribe or skin Assets/Heads does
+    not have. Naming is then a separate, optional step that only decides which
+    color to draw in.
+
+    The single link at HEAD_CLUSTER_MIN_NCC is deliberately loose rather than
+    knife-edge. The one pair in the corpus that sits between the populations
+    is vengir_cultist's, at 0.926 -- two *different* players on the same tribe
+    wearing different skins. A threshold tight enough to split them would sit
+    0.031 below the worst genuine same-player pair, calibrated on one sample;
+    the catalog splits that case cleanly instead (see split_group_by_catalog),
+    so this bar is set where both margins are comfortable.
+
+    Note what no method can separate: two players on the same tribe *and* the
+    same skin render identically, so they are one group here and there is no
+    signal anywhere that would tell them apart."""
+    names = [n for n in region_of if region_of[n] is not None]
+    parent = {n: n for n in names}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            if icon_similarity(region_of[a], region_of[b]) >= HEAD_CLUSTER_MIN_NCC:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[ra] = rb
+    groups = {}
+    for n in names:
+        groups.setdefault(find(n), []).append(n)
+    return [sorted(g) for g in groups.values()]
 
 
 # Each of the 16 tribes' own default color, straight from the "Color" column
@@ -3542,6 +4159,17 @@ def _draw_vision_fade(out, explored, keys_sorted, color_of, origin, u_col, u_row
         out[y0:y1, x0:x1] = (region * (1 - a) + col * a).astype(np.uint8)
 
 
+def _player_explored_tiles(samples, shot_names):
+    """The union, over `shot_names`, of tiles those shots' own samples
+    classified as explored -- one player's own witnessed territory, from the
+    same per-(tile, shot) classification winner selection already used.
+    Shared by draw_player_vision (the boundary outline) and the vision-each
+    per-player composites below, so "what did this player see" is answered
+    once rather than reimplemented per consumer."""
+    return {ij for ij, per in samples.items()
+            if any(per.get(n, {}).get("explored") for n in shot_names)}
+
+
 def draw_player_vision(out, samples, by_player, origin, u_col, u_row, thick):
     """Outline, in a distinct color per player, the union of tiles each
     identified player's own shot(s) witnessed as explored, with a soft wash
@@ -3563,10 +4191,8 @@ def draw_player_vision(out, samples, by_player, origin, u_col, u_row, thick):
     drawn last; every edge is instead computed once, tagged with every
     player whose boundary reaches it, and drawn solid when that is one player
     or banded (see _draw_vision_edge) when it is more than one."""
-    explored = {}
-    for key, shot_names in by_player.items():
-        explored[key] = {ij for ij, per in samples.items()
-                         if any(per.get(n, {}).get("explored") for n in shot_names)}
+    explored = {key: _player_explored_tiles(samples, shot_names)
+                for key, shot_names in by_player.items()}
     keys_sorted = [k for k in sorted(explored) if explored[k]]
     color_of = _assign_vision_colors(keys_sorted)
 
@@ -3587,6 +4213,57 @@ def draw_player_vision(out, samples, by_player, origin, u_col, u_row, thick):
         p0 = origin + v0[0] * u_col + v0[1] * u_row
         p1 = origin + v1[0] * u_col + v1[1] * u_row
         _draw_vision_edge(out, p0, p1, [color_of[k] for k in keys], thick)
+
+
+# `vision-each` wash: a flat, near-white tint rather than the game's own fog
+# art. The fog render's crystalline texture is a fixed, deterministic pattern
+# -- great as a *classifier* (see fog_period_scale) -- but laid back down over
+# real terrain at partial opacity it reads as visual noise competing with the
+# map underneath it, rather than a simple "you haven't seen this" cue. A
+# plain wash says the same thing without competing with the content.
+VISION_EACH_WASH_BGR = (255, 255, 255)
+# Not 1.0 (that would hide the real content someone else photographed) and
+# not too low to read as a wash at all; mid-range, the same role
+# OVERLAY_ALPHA's "grid" entry plays for a layer meant to be seen *and* seen
+# through.
+VISION_EACH_WASH_ALPHA = 0.55
+
+
+def _vision_each_unseen_mask(winner_tiles, explored_self, origin, u_col, u_row, W, Hc):
+    """uint8 mask, one player's "the union knows this tile but I don't" set:
+    every tile in `winner_tiles` (this run's explored union) that is not in
+    `explored_self` (this player's own witnessed tiles). Restricted to the
+    union rather than the whole board so a tile nobody explored keeps its
+    ordinary template fog untouched instead of a doubled wash."""
+    mask = np.zeros((Hc, W), np.uint8)
+    for (i, j) in winner_tiles:
+        if (i, j) in explored_self:
+            continue
+        poly = tile_poly(origin, u_col, u_row, i, j, 0.0)
+        cv2.fillConvexPoly(mask, np.round(poly).astype(np.int32), 255)
+    return mask
+
+
+def render_vision_each(out, unseen_mask, color=VISION_EACH_WASH_BGR,
+                        alpha=VISION_EACH_WASH_ALPHA):
+    """`out` (the finished composite) with a flat translucent `color` wash
+    laid over it wherever `unseen_mask` marks a tile -- real content stays
+    visible underneath, tinted just enough to read as "not yet seen by this
+    player" without obscuring what someone else's shot revealed there."""
+    a = (unseen_mask.astype(np.float32) / 255.0 * alpha)[..., None]
+    blended = out.astype(np.float32) * (1.0 - a) + np.array(color, np.float32) * a
+    return np.clip(blended, 0, 255).astype(np.uint8)
+
+
+def vision_each_slug(key):
+    """Filesystem-safe stem for a vision-each output filename. `key` is a
+    by_player key: either a head-catalog filename ("i2.png") or the
+    "unnamed player N" fallback identify_player uses when no shot in that
+    group could be matched to the catalog at all."""
+    if key.endswith(".png"):
+        return key[:-4]
+    digits = "".join(ch for ch in key if ch.isdigit())
+    return "unnamed" + (digits or "0")
 
 
 # ---------------------------------------------- board renders & templates ---
@@ -4477,18 +5154,28 @@ def main():
                     help="comma-separated decorative layers to draw on the "
                          "composite: " +
                          ", ".join(name for name, _ in OVERLAY_LAYERS) +
-                         ", vision, or 'none'. The first four come from the "
-                         "same Overlays/ renders as the board itself, so "
-                         "they need no registration; not every board size "
-                         "has every one -- a missing layer is skipped and "
-                         "reported, never an error. `vision` is computed "
-                         "rather than loaded: it identifies each shot's own "
-                         "player from its Game Stats icon (see "
-                         "identify_player) and outlines what that player's "
-                         "shot(s) alone witnessed as explored, in a "
-                         "different color per player. Best-effort -- a shot "
-                         "whose player cannot be identified with confidence "
-                         "simply contributes no outline. "
+                         ", vision, vision-each, or 'none'. The first four "
+                         "come from the same Overlays/ renders as the board "
+                         "itself, so they need no registration; not every "
+                         "board size has every one -- a missing layer is "
+                         "skipped and reported, never an error. `vision` and "
+                         "`vision-each` are computed rather than loaded: both "
+                         "identify each shot's own player from its Game "
+                         "Stats icon (see identify_player). `vision` outlines "
+                         "what each identified player's shot(s) alone "
+                         "witnessed as explored, in a different color per "
+                         "player, on the one composite --out writes. "
+                         "`vision-each` instead writes one *additional* "
+                         "composite per identified player, alongside --out, "
+                         "named <out>_vision_<player>.<ext>: the same "
+                         "composite, with a flat translucent white wash laid "
+                         "back over any tile the union explored that this "
+                         "player's own shot(s) did not, so what somebody "
+                         "else revealed but this player has not personally "
+                         "seen still reads as unexplored to them. Both are "
+                         "best-effort -- a shot whose player cannot be "
+                         "identified with confidence simply contributes no "
+                         "outline/composite. "
                          f"Default: {OVERLAY_DEFAULT}.")
     ap.add_argument("--no-badge-filter", action="store_true",
                     help="skip capture-city/capture-ruin badge detection "
@@ -4551,9 +5238,10 @@ def main():
 
     # Validated here rather than where it is used, so a typo fails immediately
     # instead of after the ~20s of work that produced the composite.
-    # `vision` is not in OVERLAY_LAYERS -- it has no Overlays/ file, so it is
-    # never handed to paint_overlays and is drawn by its own code in main().
-    known = {name for name, _ in OVERLAY_LAYERS} | {"vision"}
+    # `vision`/`vision-each` are not in OVERLAY_LAYERS -- neither has an
+    # Overlays/ file, so neither is ever handed to paint_overlays; both are
+    # drawn/written by their own code in main().
+    known = {name for name, _ in OVERLAY_LAYERS} | {"vision", "vision-each"}
     overlays = {p.strip().lower() for p in args.overlays.split(",") if p.strip()}
     overlays.discard("none")
     unknown = overlays - known
@@ -4918,16 +5606,77 @@ def main():
     # contributes no explored tiles either way) is not probed for nothing.
     player_of = {}
     no_head_catalog = False
-    if "vision" in overlays:
+    if overlays & {"vision", "vision-each"}:
         with PHASES("player identification"):
             catalog = load_head_catalog()
             no_head_catalog = not catalog
             if no_head_catalog:
                 print(f"\nNO-HEAD-CATALOG: cannot read "
                       f"{os.path.join(head_icon_dir(), '*.png')}, so no shot "
-                      f"could be matched to a player -- vision outlines skipped")
+                      f"could be matched to a player -- vision outlines/"
+                      f"per-player composites skipped")
+            # Two questions, answered separately and in this order, because
+            # they are not equally hard. *Which shots are one player* is
+            # settled by comparing the shots' own icons against each other --
+            # like for like, no reference render involved, and it keeps
+            # working for a tribe or skin Assets/Heads has never seen. *Which
+            # tribe that player is* then only decides the outline's color, and
+            # is the question that needs the catalog.
+            region_of = {n: player_icon_region(shots[n].img) for n in names}
+            groups = group_shots_by_icon(region_of)
+            # One catalog match per distinct *icon*, not per shot. Two shots by
+            # one player are usually the same icon to three decimals, so the
+            # second asks a question already answered -- and it is the only
+            # expensive question in this phase.
+            named, matched = {}, []
+            for group in groups:
+                for n in group:
+                    same = next((m for m in matched
+                                 if icon_similarity(region_of[n], region_of[m])
+                                 >= HEAD_SAME_ICON_NCC), None)
+                    if same is not None:
+                        named[n] = named[same]
+                        continue
+                    named[n] = match_head_icon(region_of[n], catalog)
+                    matched.append(n)
+            anon = 0
+            for group in groups:
+                # A group holding two *confidently different* names is two
+                # players on one tribe wearing different skins -- rare, real
+                # (tests/vengir_cultist), and the one case icon similarity
+                # alone gets wrong, since those two icons correlate higher
+                # than any other pair of different players. Split on the
+                # catalog's word, which separates them cleanly.
+                keys = sorted({named[n][0] for n in group if named.get(n)})
+                if len(keys) > 1:
+                    parts = [[n for n in group
+                              if named.get(n) and named[n][0] == k] for k in keys]
+                    # A shot the catalog could not place cannot be assigned to
+                    # either skin on this evidence, so it goes with the part
+                    # its own icon is closest to -- which is why it was in
+                    # this group at all.
+                    for n in group:
+                        if not named.get(n):
+                            parts[0].append(n)
+                else:
+                    parts = [group]
+                for part in parts:
+                    # The whole part answers as one, best score first, so a
+                    # shot the catalog cannot place still inherits its
+                    # player's identity from the shots that could. When none
+                    # of them could, the part is still a player and still
+                    # earns an outline -- under a key that is deliberately not
+                    # a catalog filename, so tribe_default_color finds nothing
+                    # and _assign_vision_colors falls back to the palette.
+                    best = max((named[n] for n in part if named.get(n)),
+                               key=lambda kn: kn[1], default=None)
+                    if best is None:
+                        anon += 1
+                        best = (f"unnamed player {anon}", 0.0)
+                    for n in part:
+                        player_of[n] = best
             for n in names:
-                player_of[n] = identify_player(shots[n].img, catalog)
+                player_of.setdefault(n, None)
 
     # Any shot spanning the whole board counts the tiles across it directly
     # (span / fog repeat period), which is an estimate of the board size owing
@@ -5718,7 +6467,7 @@ def main():
         for n, ident in player_of.items():
             if ident is not None:
                 by_player.setdefault(ident[0], []).append(n)
-        if by_player:
+        if by_player and "vision" in overlays:
             draw_player_vision(out, samples, by_player, origin, u_col, u_row, thick)
         # A fogged tile carrying a ruin gets two things: the Elyrion player's
         # own view of that tile, and a violet outline around it.
@@ -5775,6 +6524,37 @@ def main():
     x0c, y0c, x1c, y1c = output_crop(origin, u_col, u_row, N, W, Hc)
     with PHASES("encode + write output"):
         cv2.imwrite(args.out, out[y0c:y1c, x0c:x1c])
+
+    # One additional composite per identified player, each the finished
+    # composite above with a white wash laid back over any tile the union
+    # explored that this one player's own shot(s) did not -- what somebody
+    # else revealed but this player has not personally seen still reads as
+    # unexplored to them -- plus that same player's own vision boundary (see
+    # draw_player_vision) drawn on top, so the line between "mine" and
+    # "washed" reads as a frontier rather than just a color change.
+    # `by_player` and `winner` are exactly what draw_player_vision and the
+    # paste loop already computed above; this asks them nothing new, the
+    # same way that function's own docstring notes.
+    vision_each_paths = []
+    if "vision-each" in overlays and by_player:
+        with PHASES("vision-each per-player composites"):
+            out_stem, out_ext = os.path.splitext(args.out)
+            out_ext = out_ext or ".png"
+            for key in sorted(by_player):
+                explored_self = _player_explored_tiles(samples, by_player[key])
+                unseen = _vision_each_unseen_mask(winner, explored_self, origin,
+                                                   u_col, u_row, W, Hc)
+                per_out = render_vision_each(out, unseen)
+                draw_player_vision(per_out, samples, {key: by_player[key]},
+                                    origin, u_col, u_row, thick)
+                path = f"{out_stem}_vision_{vision_each_slug(key)}{out_ext}"
+                cv2.imwrite(path, per_out[y0c:y1c, x0c:x1c])
+                vision_each_paths.append(path)
+    if vision_each_paths:
+        # Named on stdout in the DROPPED/NO-OVERLAY shape so polybot can lift
+        # it straight into the merge caption/attachments.
+        print(f"VISION-EACH {len(vision_each_paths)}: "
+              + " ".join(vision_each_paths))
 
     total = N * N
     print(f"\nmap: {N}x{N} = {total} tiles")
@@ -5903,11 +6683,11 @@ def main():
         elif not no_ruin_sprite:
             print("\nElyrion ruin vision: no markers found on any fogged tile")
 
-    if "vision" in overlays and not no_head_catalog:
+    if overlays & {"vision", "vision-each"} and not no_head_catalog:
         identified = {n: ident for n, ident in player_of.items() if ident is not None}
         if identified:
             n_players = len({key for key, _ncc in identified.values()})
-            print(f"\nplayer vision outlines: {n_players} player(s) identified "
+            print(f"\nplayer identification: {n_players} player(s) identified "
                   f"from the Game Stats icon:")
             for n in names:
                 ident = player_of.get(n)
