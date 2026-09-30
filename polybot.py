@@ -110,13 +110,13 @@ OVERLAY_DEFAULT = frozenset()
 # layer the parser does not accept, or miss one it does.
 OVERLAY_HELP = {
     "shade": "checkerboard shading on fog tiles",
-    "grid": "tile grid lines on the full map",
-    "spawns": "the default spawn zones on fog tiles (for most map types)",
-    "push": "default push direction arrows on every tile",
-    "vision": "an outline around each identified player's own explored "
-              "area, one color per player (best-effort)",
-    "vision-each": "an extra image per player, white-washing what they "
-                   "haven't personally explored yet (best-effort)",
+    "grid": "tile grid lines over the whole map",
+    "spawns": "default spawn zones on fog tiles (most map types)",
+    "push": "default push-direction arrows",
+    "vision": "an outline of each identified player's explored area, one "
+              "color each (best-effort)",
+    "vision-each": "an extra image per player, washing out what they haven't "
+                   "explored themselves (best-effort)",
 }
 # Typed by players, so accept the obvious synonyms rather than making them
 # guess the one word that works.
@@ -814,9 +814,9 @@ intents = discord.Intents.default()
 # of this bot go dark differently (see CLAUDE.md for the two failure shapes,
 # one of which is actively misleading rather than silent).
 #
-# Slash commands do *not* relieve this. An interaction carries its own options,
-# but collect_marked_shots reads message.attachments off arbitrary history
-# messages, so the 🗺️ scan needs the intent however the merge was invoked.
+# Slash commands do not relieve this for `!merge`: collect_marked_shots reads
+# message.attachments off arbitrary history messages, so the 🗺️ scan needs the
+# intent. /merge never scans history, so it works without it.
 intents.message_content = True
 
 # Overridable so a second instance can run in a guild that already has one
@@ -1055,10 +1055,10 @@ class Caller:
             # is redundant -- drop it here rather than at the call sites.
             #
             # This is the whole reason clearing lives inside send: do_merge has
-            # seven early returns (missing template, no templates, no history
-            # permission, no screenshots, too many, too large, queue full) and
-            # every one of them posts a message and returns. Clearing at each
-            # was one edit per path and one more to forget on the eighth; the
+            # many early returns (missing template, no history permission, no
+            # screenshots, too many, too large, queue full, ...) and every one
+            # of them posts a message and returns. Clearing at each was one
+            # edit per path and one more to forget on the next; the
             # symptom of forgetting is a spinner that hangs until the
             # interaction expires, which is what happened on "no usable
             # screenshots found".
@@ -1252,9 +1252,11 @@ def help_text():
 
     It is deliberately the *whole* help rather than a pointer to a further
     command: someone who has gone looking for help should not have to ask
-    twice. That costs length -- ~1950 characters against Discord's 2000, so
-    there is essentially no room for more. Check len() before adding a
-    bullet; the failure is the whole message vanishing, not a truncation.
+    twice. That costs length, and Discord refuses a message over 2000
+    characters outright rather than truncating it -- so check len() before
+    adding a bullet, *with* a deployment's longer custom emoji and prefix
+    interpolated (MARK_EMOJI and DONE_EMOJI appear three times between them).
+    About 1580 characters at the defaults, 1660 with a beta instance's.
 
     The layer list is built from OVERLAY_HELP rather than written out, for the
     same anti-drift reason as everything else here: a layer the parser accepts
@@ -1293,38 +1295,32 @@ def help_text():
     # both are built from the constants. Not "`20` sets the board size (or use
     # 11, 14, 16, 18, 20)" -- the example is itself one of the sizes the "or"
     # then offers, which reads as though it were something else.
-    opts = (f"- A number sets the board size -- one of {sizes}. Otherwise it is "
-            f"measured from the screenshots.\n"
-            + "".join(f"- `{n}` shows {OVERLAY_HELP[n]}.\n" for n in OVERLAY_NAMES))
+    opts = (f"- A number sets the board size ({sizes}). Otherwise it is "
+            f"measured.\n"
+            + "".join(f"- `{n}`: {OVERLAY_HELP[n]}.\n" for n in OVERLAY_NAMES))
     return (
-        f"Usage: `{COMMAND_PREFIX}merge`, with screenshots attached to that "
-        f"message, or react {MARK_EMOJI} on screenshots posted above and run "
-        f"`{COMMAND_PREFIX}merge` with none attached. `/merge` attaches "
-        f"screenshots directly to the command instead (`new`/`new2`/`new3`) "
-        f"and does not use the {MARK_EMOJI} reaction workflow -- attach a map "
-        f"this bot posted earlier as its `base` to update that map instead of "
-        f"starting fresh, with or without new screenshots alongside it.\n"
-        f"`/merge` offers the options below as fields. With "
-        f"`{COMMAND_PREFIX}merge` they are words after the command, in any "
-        f"order, e.g. `{COMMAND_PREFIX}merge grid 20`:\n"
+        f"Usage: `{COMMAND_PREFIX}merge` with screenshots attached, or react "
+        f"{MARK_EMOJI} on screenshots above and run `{COMMAND_PREFIX}merge` "
+        f"with none attached. `/merge` takes screenshots as attachments "
+        f"(`new`/`new2`/`new3`) instead of reactions; attach a map this bot "
+        f"posted as `base` to update it, with or without new screenshots.\n"
+        f"Options (fields on `/merge`, or words in any order after "
+        f"`{COMMAND_PREFIX}merge`, e.g. `{COMMAND_PREFIX}merge grid 20`):\n"
         + opts +
         f"\n"
-        f"Other information:\n"
-        f"- Works on up to {MAX_SHOTS} shots ({COMMAND_PREFIX}merge) or 3 "
-        f"(/merge). Supported formats: {fmts}.\n"
-        f"- After a {COMMAND_PREFIX}merge from reactions, the bot reacts "
-        f"{DONE_EMOJI} on the screenshots merged, so they won't be merged "
-        f"again.\n"
+        f"Notes:\n"
+        f"- Up to {MAX_SHOTS} shots ({COMMAND_PREFIX}merge) or 3 (/merge); "
+        f"{fmts}.\n"
+        f"- After a reaction merge the bot reacts {DONE_EMOJI} on the shots "
+        f"used, so they aren't merged again.\n"
         f"- Each screenshot needs two adjoining sides of the board in frame.\n"
-        f"- Assumes the top and bottom 15% of screenshots contain UI elements "
-        f"and crops them.\n"
-        f"- Fog tiles may carry purple outlines for ruins seen in Elyrion "
-        f"screenshots.\n"
-        f"- Shots without fog may need the board size stated. The bot says so "
-        f"when it could not confirm the size it used.\n"
-        f"- The merge takes the highest-resolution shot, except it "
-        f"deprioritizes tiles with village/ruin capture badges and "
-        f"prioritizes tiles with city population bars.\n"
+        f"- The top and bottom 15% of each screenshot are cropped as UI.\n"
+        f"- Purple outlines on fog mark ruins seen in Elyrion screenshots.\n"
+        f"- Shots without fog may need the size stated; the bot says when it "
+        f"couldn't confirm it.\n"
+        f"- Each tile comes from the highest-resolution shot, except shots "
+        f"with a capture badge there lose priority and shots showing a city's "
+        f"population bar gain it.\n"
         f"\n"
         f"Credits: Made by palanq, with support from our robot overlords and "
         f"the ArcticWolves team. {CREDIT_EMOJI}"
@@ -1361,7 +1357,9 @@ async def merge(ctx, size: str = None, *extras):
     one queue, one estimate and one set of channel copy whichever way a merge
     was asked for."""
     caller = Caller.from_ctx(ctx)
-    log_invocation(caller, f"{COMMAND_PREFIX}merge {size} {' '.join(extras)}")
+    log_invocation(caller, " ".join([f"{COMMAND_PREFIX}merge"]
+                                    + ([size] if size is not None else [])
+                                    + list(extras)))
     if size is not None and size.lower() in ("help", "?"):
         await caller.send(help_text())
         return
