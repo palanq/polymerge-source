@@ -985,6 +985,10 @@ def perm_report(channel, me, needed=None):
                                   for k in missing)
 
 
+# Interaction tokens last 15 minutes; leave a minute of margin.
+INTERACTION_TOKEN_S = 14 * 60
+
+
 class Caller:
     """Whoever asked for a merge, over either entry point.
 
@@ -1004,7 +1008,8 @@ class Caller:
     the queue notice below be edited for as long as the queue takes."""
 
     __slots__ = ("channel", "guild", "author", "attachments",
-                 "_ctx", "_interaction", "_placeholder")
+                 "_ctx", "_interaction", "_placeholder",
+                 "_placeholder_live", "_channel_blocked", "_born")
 
     def __init__(self, channel, guild, author, attachments,
                  ctx=None, interaction=None):
@@ -1017,6 +1022,11 @@ class Caller:
         # Whether the deferral's ephemeral "thinking" placeholder is still on
         # screen. False for a prefix command, which never has one.
         self._placeholder = interaction is not None
+        self._placeholder_live = self._placeholder
+        # Set once the channel has refused us, so later messages go straight to
+        # the interaction instead of failing again first.
+        self._channel_blocked = False
+        self._born = time.monotonic()
 
     @classmethod
     def from_ctx(cls, ctx):
@@ -1047,37 +1057,72 @@ class Caller:
 
         `reply` is honored for a prefix command and ignored for a slash one,
         which has no invoking message to reply to."""
+        if not self._channel_blocked:
+            try:
+                send = (self._ctx.reply if reply and self._ctx is not None
+                        else self.channel.send)
+                msg = (await send(content, **kw) if content is not None
+                       else await send(**kw))
+                # Anything visible has now been said, so the "thinking"
+                # placeholder is redundant -- drop it here rather than at the
+                # call sites. Clearing at each of do_merge's early returns was
+                # one edit per path and one more to forget; the symptom of
+                # forgetting is a spinner that hangs until the interaction
+                # expires.
+                await self.clear_placeholder()
+                return msg
+            except discord.Forbidden:
+                where = getattr(self.channel, "name", self.channel)
+                me = self.guild.me if self.guild else None
+                detail = perm_report(self.channel, me) if me else "DM"
+                print(f"cannot post in #{where}: {detail}", file=sys.stderr)
+                self._channel_blocked = self._interaction is not None
+                if not self._channel_blocked:
+                    return None
+        if self._interaction is not None:
+            msg = await self._followup(content, **kw)
+            if msg is not None:
+                return msg
+        # Nothing worked. A slash command still has the ephemeral response,
+        # which is exempt from the channel's overwrites, so say which
+        # permission is missing rather than nothing at all (!merge cannot do
+        # this: without view_channel it never receives the command).
+        me = self.guild.me if self.guild else None
+        detail = perm_report(self.channel, me) if me else "DM"
+        await self.tell_privately(
+            f"I can't post in this channel. {SAD_EMOJI} {detail}.")
+        return None
+
+    async def _followup(self, content, **kw):
+        """Post publicly through the interaction when the channel won't allow it.
+
+        Interaction responses are exempt from channel permission checks, so this
+        works with no Send Messages / Attach Files at all -- at the price of the
+        15-minute token. It is only the fallback: the ordinary route is a
+        channel message, which never expires.
+
+        The deferral was ephemeral, and the first followup after a deferral
+        *becomes* the deferred message, inheriting its ephemeral flag. So the
+        placeholder is turned into a real message first; later followups choose
+        their own visibility, and are public here.
+
+        Returns None if the token has expired or the call fails."""
+        if time.monotonic() - self._born > INTERACTION_TOKEN_S:
+            print("followup unavailable: interaction token expired",
+                  file=sys.stderr)
+            return None
         try:
-            send = (self._ctx.reply if reply and self._ctx is not None
-                    else self.channel.send)
-            msg = await send(content, **kw) if content is not None else await send(**kw)
-            # Anything visible has now been said, so the "thinking" placeholder
-            # is redundant -- drop it here rather than at the call sites.
-            #
-            # This is the whole reason clearing lives inside send: do_merge has
-            # many early returns (missing template, no history permission, no
-            # screenshots, too many, too large, queue full, ...) and every one
-            # of them posts a message and returns. Clearing at each was one
-            # edit per path and one more to forget on the next; the
-            # symptom of forgetting is a spinner that hangs until the
-            # interaction expires, which is what happened on "no usable
-            # screenshots found".
+            if self._placeholder_live:
+                self._placeholder_live = False
+                await self._interaction.edit_original_response(
+                    content="Posting your map below...")
+            msg = await self._interaction.followup.send(
+                content if content is not None else discord.utils.MISSING,
+                ephemeral=False, wait=True, **kw)
             await self.clear_placeholder()
             return msg
-        except discord.Forbidden:
-            where = getattr(self.channel, "name", self.channel)
-            me = self.guild.me if self.guild else None
-            detail = perm_report(self.channel, me) if me else "DM"
-            print(f"cannot post in #{where}: {detail}", file=sys.stderr)
-            # A slash command still has one channel left when the public one is
-            # shut: the interaction's own ephemeral response, which is exempt
-            # from the channel's permission overwrites. This is the one thing
-            # !merge can never do -- without view_channel it never even
-            # receives the command -- so it is worth the extra call to tell the
-            # player exactly which permission is missing rather than to say
-            # nothing at all.
-            await self.tell_privately(
-                f"I can't post in this channel. {SAD_EMOJI} {detail}.")
+        except discord.HTTPException as e:
+            print(f"followup failed: {e}", file=sys.stderr)
             return None
 
     async def tell_privately(self, content):
