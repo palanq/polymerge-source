@@ -1069,7 +1069,7 @@ class Caller:
                 except discord.HTTPException:
                     pass
 
-    async def send(self, content=None, *, reply=True, **kw):
+    async def send(self, content=None, *, reply=True, paths=(), **kw):
         """Post to the channel, surviving having no permission to.
 
         Every channel-facing message goes through this. Without it a missing
@@ -1079,14 +1079,31 @@ class Caller:
         Only Forbidden is swallowed, and only after logging the diagnosis to
         the console; anything else propagates to the error handlers as normal.
 
+        Three routes, tried in order: the channel; for a slash command, a
+        public interaction followup; and, for a message carrying `paths` (the
+        composite), a DM to whoever asked. Some servers deliberately keep the
+        bot out of their game channels, and the DM is the one route that
+        depends on nothing the channel grants.
+
+        Files go in as `paths`, not discord.File objects, because discord.py
+        closes every File after any send attempt -- failed ones included -- so
+        each route needs fresh ones.
+
         `reply` is honored for a prefix command and ignored for a slash one,
         which has no invoking message to reply to."""
+        def route_kw():
+            if not paths:
+                return kw
+            return dict(kw, files=[discord.File(p, filename=p.name)
+                                   for p in paths])
+
         if not self._channel_blocked:
             try:
                 send = (self._ctx.reply if reply and self._ctx is not None
                         else self.channel.send)
-                msg = (await send(content, **kw) if content is not None
-                       else await send(**kw))
+                rkw = route_kw()
+                msg = (await send(content, **rkw) if content is not None
+                       else await send(**rkw))
                 # Anything visible has now been said, so the "thinking"
                 # placeholder is redundant -- drop it here rather than at the
                 # call sites. Clearing at each of do_merge's early returns was
@@ -1100,30 +1117,55 @@ class Caller:
                 me = self.guild.me if self.guild else None
                 detail = perm_report(self.channel, me) if me else "DM"
                 print(f"cannot post in #{where}: {detail}", file=sys.stderr)
-                self._channel_blocked = self._interaction is not None
-                if not self._channel_blocked:
-                    return None
+                # Latched so later messages skip a route already refused.
+                self._channel_blocked = True
         if self._interaction is not None:
-            msg = await self._followup(content, **kw)
+            msg = await self._followup(content, **route_kw())
             if msg is not None:
                 return msg
+        if paths:
+            msg = await self._dm(content, route_kw())
+            if msg is not None:
+                await self.tell_privately(
+                    "I can't post the map in this channel, so I've sent it "
+                    "to your DMs.")
+                return msg
         # Nothing worked. A slash command still has the ephemeral response,
-        # which is exempt from the channel's overwrites, so say which
+        # which the channel's overwrites cannot block, so say which
         # permission is missing rather than nothing at all (!merge cannot do
         # this: without view_channel it never receives the command).
         me = self.guild.me if self.guild else None
         detail = perm_report(self.channel, me) if me else "DM"
+        tail = (" I couldn't DM it to you either -- allow DMs from server "
+                "members and merge again." if paths else "")
         await self.tell_privately(
-            f"I can't post in this channel. {SAD_EMOJI} {detail}.")
+            f"I can't post in this channel. {SAD_EMOJI} {detail}.{tail}")
         return None
+
+    async def _dm(self, content, kw):
+        """Send the composite to the invoker directly, the last route.
+
+        Fails with Forbidden (50007) when the player does not accept DMs from
+        server members, which is theirs to change, so it is logged and
+        reported rather than raised."""
+        head = f"Here's your map from <#{self.channel.id}> -- I can't post there."
+        text = f"{head}\n{content}" if content else head
+        try:
+            return await self.author.send(text[:2000], **kw)
+        except discord.HTTPException as e:
+            print(f"DM to {self.author} failed: {e}", file=sys.stderr)
+            return None
 
     async def _followup(self, content, **kw):
         """Post publicly through the interaction when the channel won't allow it.
 
-        Interaction responses are exempt from channel permission checks, so this
-        works with no Send Messages / Attach Files at all -- at the price of the
-        15-minute token. It is only the fallback: the ordinary route is a
-        channel message, which never expires.
+        Measured in production: a followup posts text in a channel where the
+        bot has no permissions at all, View Channel included. Discord's
+        changelog (1 Nov 2023) says followups follow the bot user's
+        permissions, though, so one carrying files may still be refused
+        without Attach Files -- which is what the DM route after this is for.
+        It costs the 15-minute token, so it is only the fallback: the ordinary
+        route is a channel message, which never expires.
 
         The deferral was ephemeral, and the first followup after a deferral
         *becomes* the deferred message, inheriting its ephemeral flag. So the
@@ -2088,10 +2130,9 @@ async def do_merge(caller, map_size, overlays, base=None, allow_history=True):
         # out_path.name, not a hardcoded "merged.png": the upload-size
         # fallback above may have swapped in a JPEG, and labeling that .png
         # would hand clients a file whose extension lies about its contents.
-        # Same for each extra path.
-        files = [discord.File(out_path, filename=out_path.name)] + [
-            discord.File(p, filename=p.name) for p in extra_paths]
-        posted = await caller.send(reply=False, content=caption, files=files)
+        # Same for each extra path (Caller.send names each by p.name).
+        posted = await caller.send(reply=False, content=caption,
+                                   paths=[out_path, *extra_paths])
 
         # Mark history-sourced shots consumed so the next !merge here doesn't
         # pick them up again -- but only once the composite has actually landed.
