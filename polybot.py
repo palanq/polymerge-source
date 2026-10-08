@@ -1159,12 +1159,9 @@ class Caller:
     async def _followup(self, content, **kw):
         """Post publicly through the interaction when the channel won't allow it.
 
-        Measured in production: a followup posts text in a channel where the
-        bot has no permissions at all, View Channel included. Discord's
-        changelog (1 Nov 2023) says followups follow the bot user's
-        permissions, though, so one carrying files may still be refused
-        without Attach Files -- which is what the DM route after this is for.
-        It costs the 15-minute token, so it is only the fallback: the ordinary
+        Measured: a followup posts text, and the composite as a file, in a
+        channel where the bot has no permissions at all -- View Channel and
+        Attach Files included. It costs the 15-minute token, so it is only the fallback: the ordinary
         route is a channel message, which never expires.
 
         The deferral was ephemeral, and the first followup after a deferral
